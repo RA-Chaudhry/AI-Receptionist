@@ -1,0 +1,52 @@
+import sys, os
+sys.stdout.reconfigure(line_buffering=True)
+sys.path.insert(0, os.path.abspath("."))
+
+import asyncio
+import json
+import websockets
+import edge_tts
+from app.utils.audio_buffer import mp3_to_pcm
+
+async def main():
+    print("1. Generating Urdu TTS audio...", flush=True)
+    comm = edge_tts.Communicate("السلام علیکم! کیا میری آواز آ رہی ہے؟", "ur-PK-UzmaNeural")
+    mp3_data = b""
+    async for chunk in comm.stream():
+        if chunk.get("type") == "audio":
+            mp3_data += chunk.get("data", b"")
+    pcm_data = mp3_to_pcm(mp3_data, target_rate=16000)
+    print(f"2. Audio ready: {len(pcm_data)} bytes ({len(pcm_data)/32000:.2f}s)", flush=True)
+    
+    uri = "ws://127.0.0.1:8000/api/v1/voice/stream?phone_number=test_urdu_user"
+    print(f"3. Connecting to {uri}...", flush=True)
+    async with websockets.connect(uri) as ws:
+        print("4. Connected! Sending audio in 100ms frames...", flush=True)
+        chunk_size = 3200
+        for i in range(0, len(pcm_data), chunk_size):
+            chunk = pcm_data[i : i + chunk_size]
+            await ws.send(chunk)
+            await asyncio.sleep(0.04)
+        
+        print("5. Sending speech_ended event...", flush=True)
+        await ws.send(json.dumps({"type": "speech_ended"}))
+
+        print("6. Waiting for server events...", flush=True)
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=20.0)
+                if isinstance(msg, str):
+                    payload = json.loads(msg)
+                    print(f"   [RECV JSON] type={payload.get('type')}, data={payload.get('data', '')[:80]}", flush=True)
+                    if payload.get("type") in ("response_end", "goodbye", "timeout", "error"):
+                        break
+                else:
+                    print(f"   [RECV BINARY] {len(msg)} bytes", flush=True)
+            except asyncio.TimeoutError:
+                print("   [TIMEOUT] Server took > 20s", flush=True)
+                break
+
+    print("7. Done!", flush=True)
+
+if __name__ == "__main__":
+    asyncio.run(main())

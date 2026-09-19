@@ -1,0 +1,1576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Receptionist Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: '#1a73e8', // Gemini-like Google blue
+            accent: '#34a853', // Green
+          },
+          boxShadow: {
+            card: '0 1px 3px rgba(60,64,67,0.3), 0 4px 8px 3px rgba(60,64,67,0.15)',
+            inputBar: '0 2px 6px 0 rgba(60,64,67,0.15), 0 1px 2px 0 rgba(60,64,67,0.3)',
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    :root {
+      color-scheme: light;
+    }
+    html.dark {
+      color-scheme: dark;
+    }
+    body {
+      background-color: #ffffff;
+    }
+    html.dark body {
+      background-color: #131314;
+    }
+    .message-scroll::-webkit-scrollbar,
+    .scrollbar::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    .message-scroll::-webkit-scrollbar-thumb,
+    .scrollbar::-webkit-scrollbar-thumb {
+      background: rgba(128, 134, 139, 0.2);
+      border-radius: 999px;
+    }
+    .bubble-in {
+      animation: bubbleIn 0.25s cubic-bezier(0, 0, 0.2, 1);
+    }
+    @keyframes bubbleIn {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    
+    /* Gemini Pulsing Waveform Background Gradient Animation */
+    @keyframes geminiFlow {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    .gemini-waves-bg {
+      background: linear-gradient(270deg, rgba(66, 133, 244, 0.12), rgba(219, 68, 85, 0.12), rgba(15, 157, 88, 0.12), rgba(244, 180, 0, 0.12));
+      background-size: 400% 400%;
+      animation: geminiFlow 6s ease infinite, pulse 2.2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+    
+    .sidebar-transition {
+      transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1), width 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+  </style>
+</head>
+<body class="h-screen overflow-hidden text-slate-800 dark:text-slate-200 flex flex-col font-sans">
+
+  <!-- Header -->
+  <header class="h-16 border-b border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md px-4 flex items-center justify-between shrink-0 z-20">
+    <div class="flex items-center gap-3">
+      <!-- Sidebar Toggle Button -->
+      <button id="sidebarToggle" class="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500 dark:text-slate-400 transition" title="Toggle Panel">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5.5 h-5.5">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
+        </svg>
+      </button>
+      <div class="flex items-center gap-2">
+        <span class="text-base font-bold text-slate-900 dark:text-white tracking-tight">Concierge AI</span>
+        <span class="text-xs text-slate-400 dark:text-slate-500" id="voiceModeBadge">Checking...</span>
+      </div>
+    </div>
+    <div class="flex items-center gap-2">
+      <button id="themeToggle" class="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500 dark:text-slate-400 transition" title="Toggle theme">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5 h-5">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M12 3v2.25m6.364.386-1.591 1.591M21 12h-2.25m-.386 6.364-1.591-1.591M12 18.75V21m-4.773-4.227-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0Z" />
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- Container for Sidebar + Chat Area -->
+  <div class="flex-1 flex overflow-hidden relative">
+
+    <!-- Left Collapsible Sidebar -->
+    <aside id="sidebar" class="w-[300px] border-r border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/20 shrink-0 sidebar-transition flex flex-col h-full overflow-hidden z-10">
+      <div class="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-white dark:bg-slate-900/50 shrink-0">
+        <h2 class="font-bold text-xs uppercase tracking-widest text-slate-400">Data & CRM Center</h2>
+      </div>
+
+      <div class="flex-1 overflow-y-auto scrollbar p-4 space-y-5">
+        <!-- Quick navigation tab selection inside sidebar -->
+        <div class="space-y-1.5">
+          <div class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Features</div>
+          <div class="grid grid-cols-2 gap-1.5" id="navMenu">
+            <button data-nav="dashboard" class="nav-btn text-xs text-left rounded-lg px-2.5 py-1.5 font-medium bg-brand text-white">Dashboard</button>
+            <button data-nav="chat" class="nav-btn text-xs text-left rounded-lg px-2.5 py-1.5 font-medium hover:bg-slate-100 dark:hover:bg-slate-800 transition">Chats</button>
+            <button data-nav="reviews" class="nav-btn text-xs text-left rounded-lg px-2.5 py-1.5 font-medium hover:bg-slate-100 dark:hover:bg-slate-800 transition">Reviews</button>
+            <button data-nav="voice" class="nav-btn text-xs text-left rounded-lg px-2.5 py-1.5 font-medium hover:bg-slate-100 dark:hover:bg-slate-800 transition">Voice Test</button>
+          </div>
+        </div>
+
+        <!-- Active Users CRM -->
+        <section data-panel="dashboard users" class="space-y-2">
+          <div class="flex items-center justify-between">
+            <h3 class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Active Contacts</h3>
+            <span class="text-[10px] text-emerald-600 font-bold" id="onlineCount">0 online</span>
+          </div>
+          <div class="grid grid-cols-2 gap-2 text-center text-xs pb-1">
+            <div class="rounded-xl border border-slate-200 dark:border-slate-800 p-2 bg-white dark:bg-slate-900/40">
+              <div class="text-[10px] text-slate-400">Chats</div>
+              <div class="font-bold text-sm" id="totalChats">0</div>
+            </div>
+            <div class="rounded-xl border border-slate-200 dark:border-slate-800 p-2 bg-white dark:bg-slate-900/40">
+              <div class="text-[10px] text-slate-400">Users</div>
+              <div class="font-bold text-sm" id="totalUsers">0</div>
+            </div>
+          </div>
+          <div id="activeUsers" class="max-h-48 space-y-1.5 overflow-y-auto scrollbar pr-1"></div>
+        </section>
+
+        <!-- Selected Contact Details -->
+        <section class="space-y-2">
+          <h3 class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Selected Client</h3>
+          <div id="userCard"></div>
+        </section>
+
+        <!-- Google Review Assistant Section -->
+        <section data-panel="dashboard reviews" class="space-y-2.5 border-t border-slate-200 dark:border-slate-850 pt-4">
+          <h3 class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Review Reply</h3>
+          <textarea id="reviewInput" rows="3" placeholder="Paste customer review..." class="w-full text-xs rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 py-2 outline-none focus:ring-1.5 focus:ring-brand"></textarea>
+          <div class="flex gap-2">
+            <button id="generateReviewBtn" class="flex-1 rounded-xl bg-slate-900 text-white dark:bg-slate-800 px-3 py-1.5 text-xs font-semibold hover:opacity-90 transition">
+              <span id="reviewSpinner" class="hidden mr-1.5 h-3 w-3 animate-spin rounded-full border-2 border-white border-t-transparent inline-block"></span>
+              Generate
+            </button>
+            <button id="copyReviewBtn" class="rounded-xl border border-slate-200 dark:border-slate-800 px-3 py-1.5 text-xs hover:bg-slate-100 dark:hover:bg-slate-800 transition">Copy</button>
+          </div>
+          <div class="rounded-xl bg-slate-100/50 dark:bg-slate-900/30 p-3 text-xs leading-relaxed text-slate-600 dark:text-slate-400" id="reviewReply">
+            Reply output appears here.
+          </div>
+        </section>
+
+        <!-- Configuration Settings & Actions -->
+        <section class="space-y-2 border-t border-slate-200 dark:border-slate-850 pt-4">
+          <div class="flex items-center justify-between">
+            <h3 class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Client Identity</h3>
+            <button id="clearHistoryBtn" class="text-[10px] text-brand hover:underline">Clear Chat History</button>
+          </div>
+          <div class="space-y-1.5">
+            <input id="userName" type="text" placeholder="Identity name" class="w-full text-xs rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 py-1.5 outline-none mb-1">
+            <input id="userEmail" type="email" placeholder="Identity email" class="w-full text-xs rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 py-1.5 outline-none">
+          </div>
+          <div class="grid grid-cols-2 gap-2 pt-1">
+            <button id="newConversationBtn" class="rounded-xl border border-slate-200 dark:border-slate-800 py-1.5 text-xs font-semibold hover:bg-slate-100 dark:hover:bg-slate-800 transition">Reset</button>
+            <button id="loadHistoryBtn" class="rounded-xl bg-brand text-white py-1.5 text-xs font-semibold hover:opacity-90 transition">Load Logs</button>
+          </div>
+          <select id="userSelect" class="hidden"></select>
+        </section>
+
+        <!-- Developer Voice Test Settings -->
+        <section data-panel="dashboard voice" class="space-y-3.5 border-t border-slate-200 dark:border-slate-850 pt-4">
+          <h3 class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">WebSocket Test Panel</h3>
+          
+          <label class="block space-y-1">
+            <span class="text-[10px] text-slate-400">Voice Phone Number</span>
+            <input id="voicePhoneNumber" type="text" placeholder="Caller ID (Optional)" class="w-full text-xs rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 py-1.5 outline-none">
+          </label>
+
+          <div class="flex items-center gap-2">
+            <input id="voiceDemoMode" type="checkbox" class="h-4 w-4 rounded border-slate-300 text-brand focus:ring-brand">
+            <label for="voiceDemoMode" class="text-xs text-slate-500">Demo Fallback Mode</label>
+          </div>
+
+          <div class="grid grid-cols-2 gap-1.5 text-[10px] text-center">
+            <div class="rounded-xl border border-slate-200 dark:border-slate-800 p-1.5">
+              <span class="text-slate-400">WebSocket</span>
+              <div id="voiceConnectionStatus" class="font-bold mt-0.5">Disconnected</div>
+            </div>
+            <div class="rounded-xl border border-slate-200 dark:border-slate-800 p-1.5">
+              <span class="text-slate-400">Whisper</span>
+              <div id="voiceBackendStatus" class="font-bold mt-0.5">Unknown</div>
+            </div>
+          </div>
+
+          <div class="flex gap-2">
+            <button id="startVoiceBtn" class="flex-1 rounded-xl bg-slate-900 text-white dark:bg-slate-800 py-1.5 text-xs font-semibold hover:opacity-95 transition">Start stream</button>
+            <button id="stopVoiceBtn" class="flex-1 rounded-xl border border-slate-200 dark:border-slate-800 py-1.5 text-xs hover:bg-slate-100 dark:hover:bg-slate-800 transition">Stop stream</button>
+          </div>
+
+          <div class="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5 space-y-2">
+            <div class="flex items-center justify-between text-[10px]">
+              <span class="text-slate-400 font-bold uppercase">RMS Mic Volume</span>
+              <span id="voiceLevelText" class="font-bold">0%</span>
+            </div>
+            <div class="h-1.5 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+              <div id="voiceLevelBar" class="h-full w-0 bg-brand transition-all duration-100"></div>
+            </div>
+            <canvas id="voiceWaveform" class="h-14 w-full rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-100 dark:border-slate-850 mt-1"></canvas>
+          </div>
+
+          <div class="grid grid-cols-2 gap-1.5 text-[10px] text-center">
+            <div class="rounded-xl border border-slate-200 dark:border-slate-800 p-1.5">
+              <span class="text-slate-400">Transcripts</span>
+              <div id="voiceTranscriptCount" class="font-bold mt-0.5">0</div>
+            </div>
+            <div class="rounded-xl border border-slate-200 dark:border-slate-800 p-1.5">
+              <span class="text-slate-400">Replies</span>
+              <div id="voiceResponseCount" class="font-bold mt-0.5">0</div>
+            </div>
+          </div>
+
+          <div class="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+            <div class="text-[10px] uppercase text-slate-400 font-bold mb-1.5">Voice WebSocket Log</div>
+            <div id="voiceLog" class="max-h-36 space-y-1 overflow-y-auto scrollbar text-[11px]"></div>
+          </div>
+
+          <div class="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5 space-y-2 bg-slate-50/50 dark:bg-slate-900/20">
+            <div class="text-xs font-semibold">Demo Input Simulator</div>
+            <textarea id="voiceDemoTranscript" rows="2" class="w-full text-xs rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 py-1.5 outline-none">Hello, I need help booking an appointment.</textarea>
+            <button id="sendVoiceDemoBtn" class="w-full rounded-xl bg-slate-900 text-white dark:bg-slate-800 py-1.5 text-xs font-semibold hover:opacity-90 transition">Send Mock</button>
+          </div>
+        </section>
+
+        <!-- Template prompts -->
+        <section class="space-y-2 border-t border-slate-200 dark:border-slate-850 pt-4">
+          <h3 class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Quick Prompts</h3>
+          <div class="grid grid-cols-2 gap-1.5 text-[11px]">
+            <button id="quickGreeting" class="rounded-xl border border-slate-200 dark:border-slate-800 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-800 transition">Greeting</button>
+            <button id="quickBooking" class="rounded-xl border border-slate-200 dark:border-slate-800 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-800 transition">Booking</button>
+            <button id="quickReview" class="rounded-xl border border-slate-200 dark:border-slate-800 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-800 transition">Positive Review</button>
+            <button id="quickThanks" class="rounded-xl border border-slate-200 dark:border-slate-800 py-1.5 hover:bg-slate-100 dark:hover:bg-slate-800 transition">Thank You</button>
+          </div>
+        </section>
+      </div>
+    </aside>
+
+    <!-- Main Chat Workspace (Centered Chat Area) -->
+    <div class="flex-1 flex flex-col h-full overflow-hidden relative bg-[#ffffff] dark:bg-[#131314]">
+      
+      <!-- Wide scrollable chat room -->
+      <div id="messages" class="flex-1 overflow-y-auto message-scroll px-6 py-8 space-y-6 max-w-4xl w-full mx-auto"></div>
+
+      <!-- Typing Indicator -->
+      <div id="typingState" class="hidden justify-center items-center gap-1.5 text-xs text-slate-400 dark:text-slate-500 pb-2">
+        <span class="h-1.5 w-1.5 rounded-full bg-brand animate-pulse"></span>
+        AI is typing...
+      </div>
+
+      <!-- Floating input bar wrapper -->
+      <div class="shrink-0 w-full px-6 pb-8">
+        <div class="max-w-3xl mx-auto relative">
+          
+          <!-- Unified, Integrated Gemini-like input bar (Pill-shaped) -->
+          <div id="inputPill" class="flex items-end gap-2 rounded-full border border-slate-200 dark:border-slate-800 bg-[#f0f4f9] dark:bg-[#1e1f20] px-5 py-2.5 relative overflow-hidden transition-all duration-350">
+            <!-- Multipulsing wave overlay behind text/icons when recording active -->
+            <div id="geminiWaves" class="gemini-waves-bg absolute inset-0 pointer-events-none hidden z-0"></div>
+            
+            <textarea id="messageInput" rows="1" placeholder="Ask anything or request booking..." class="flex-1 max-h-36 resize-none bg-transparent border-none outline-none py-1.5 text-slate-800 dark:text-slate-100 text-sm placeholder-slate-500 dark:placeholder-slate-400 min-h-[32px] z-10 font-sans"></textarea>
+            
+            <div class="flex items-center gap-1 shrink-0 z-10">
+              <!-- Unified Microphone Icon Button -->
+              <button id="micBtn" class="p-2.5 rounded-full text-red-500 dark:text-red-400 hover:bg-slate-200 dark:hover:bg-slate-800 transition" title="Voice Session">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5.5 h-5.5">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M12 18.75a6 6 0 0 0 6-6v-1.5m-6 7.5a6 6 0 0 1-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 0 1-3-3V4.5a3 3 0 1 1 6 0v8.25a3 3 0 0 1-3 3Z" />
+                </svg>
+              </button>
+              
+              <!-- Send Icon Button -->
+              <button id="sendBtn" class="p-2.5 rounded-full text-brand hover:bg-slate-200 dark:hover:bg-slate-800 transition flex items-center justify-center" title="Send message">
+                <span id="sendSpinner" class="hidden h-5.5 w-5.5 animate-spin rounded-full border-2 border-brand border-t-transparent"></span>
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5.5 h-5.5" id="sendBtnIcon">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M6 12 3.269 3.125A59.769 59.769 0 0 1 21.485 12 59.768 59.768 0 0 1 3.27 20.875L5.999 12Zm0 0h7.5" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+    </div>
+  </div>
+
+  <!-- Toast notifications -->
+  <div id="toastContainer" class="fixed bottom-4 right-4 z-50 space-y-3"></div>
+
+  <script>
+    const API_BASE = '/api/v1';
+    const state = {
+      users: [],
+      currentUser: null,
+      messages: [],
+      reviewReply: '',
+      theme: localStorage.getItem('theme') || 'light',
+      historyView: [],
+      activeView: 'dashboard',
+      voice: {
+        status: 'idle',
+        backend: 'unknown',
+        whisperLoaded: false,
+        vadLoaded: false,
+        demoMode: false,
+        level: 0,
+        connected: false,
+        recording: false,
+        transcriptCount: 0,
+        responseCount: 0,
+        phoneNumber: '',
+        websocket: null,
+        mediaStream: null,
+        audioContext: null,
+        sourceNode: null,
+        processorNode: null,
+        analyserNode: null,
+        gainNode: null,
+        waveformFrame: null,
+        floatBuffer: [],
+        sendTimer: null,
+        pendingResponseChunks: [],
+        activeAudio: null,
+        speaking: false,
+        silenceStart: null,
+      },
+    };
+
+    const els = {
+      userSelect: document.getElementById('userSelect'),
+      userName: document.getElementById('userName'),
+      userEmail: document.getElementById('userEmail'),
+      messageInput: document.getElementById('messageInput'),
+      messages: document.getElementById('messages'),
+      sendBtn: document.getElementById('sendBtn'),
+      sendSpinner: document.getElementById('sendSpinner'),
+      reviewInput: document.getElementById('reviewInput'),
+      reviewReply: document.getElementById('reviewReply'),
+      generateReviewBtn: document.getElementById('generateReviewBtn'),
+      reviewSpinner: document.getElementById('reviewSpinner'),
+      copyReviewBtn: document.getElementById('copyReviewBtn'),
+      activeUsers: document.getElementById('activeUsers'),
+      onlineCount: document.getElementById('onlineCount'),
+      totalChats: document.getElementById('totalChats'),
+      totalUsers: document.getElementById('totalUsers'),
+      userCard: document.getElementById('userCard'),
+      historyPanel: document.getElementById('historyPanel'),
+      typingState: document.getElementById('typingState'),
+      toastContainer: document.getElementById('toastContainer'),
+      themeToggle: document.getElementById('themeToggle'),
+      refreshBtn: document.getElementById('refreshBtn'),
+      clearHistoryBtn: document.getElementById('clearHistoryBtn'),
+      newConversationBtn: document.getElementById('newConversationBtn'),
+      loadHistoryBtn: document.getElementById('loadHistoryBtn'),
+      quickGreeting: document.getElementById('quickGreeting'),
+      quickBooking: document.getElementById('quickBooking'),
+      quickReview: document.getElementById('quickReview'),
+      quickThanks: document.getElementById('quickThanks'),
+      voicePhoneNumber: document.getElementById('voicePhoneNumber'),
+      voiceDemoMode: document.getElementById('voiceDemoMode'),
+      startVoiceBtn: document.getElementById('startVoiceBtn'),
+      stopVoiceBtn: document.getElementById('stopVoiceBtn'),
+      sendVoiceDemoBtn: document.getElementById('sendVoiceDemoBtn'),
+      voiceDemoTranscript: document.getElementById('voiceDemoTranscript'),
+      voiceLog: document.getElementById('voiceLog'),
+      voiceConnectionStatus: document.getElementById('voiceConnectionStatus'),
+      voiceBackendStatus: document.getElementById('voiceBackendStatus'),
+      voiceModeBadge: document.getElementById('voiceModeBadge'),
+      voiceTranscriptCount: document.getElementById('voiceTranscriptCount'),
+      voiceResponseCount: document.getElementById('voiceResponseCount'),
+      voiceLevelBar: document.getElementById('voiceLevelBar'),
+      voiceLevelText: document.getElementById('voiceLevelText'),
+      voiceWaveform: document.getElementById('voiceWaveform'),
+      
+      // Sidebar Collapsible Toggles
+      sidebarToggle: document.getElementById('sidebarToggle'),
+      sidebar: document.getElementById('sidebar'),
+      micBtn: document.getElementById('micBtn'),
+      sendBtnIcon: document.getElementById('sendBtnIcon'),
+      geminiWaves: document.getElementById('geminiWaves'),
+      inputPill: document.getElementById('inputPill'),
+    };
+
+    function applyTheme(theme) {
+      const root = document.documentElement;
+      if (theme === 'dark') {
+        root.classList.add('dark');
+      } else {
+        root.classList.remove('dark');
+      }
+      state.theme = theme;
+      localStorage.setItem('theme', theme);
+    }
+
+    function escapeHtml(text) {
+      return text
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function formatTime(value) {
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return '';
+      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+
+    function showToast(message, type = 'info') {
+      const colors = {
+        info: 'bg-slate-900 dark:bg-slate-800 text-white',
+        success: 'bg-emerald-600 text-white',
+        error: 'bg-red-600 text-white',
+      };
+      const toast = document.createElement('div');
+      toast.className = `toast rounded-2xl px-4 py-3 shadow-soft ${colors[type]} max-w-sm`;
+      toast.innerHTML = `<div class="text-sm font-medium">${escapeHtml(message)}</div>`;
+      els.toastContainer.appendChild(toast);
+      setTimeout(() => toast.remove(), 3200);
+    }
+
+    function appendVoiceLog(message, tone = 'info') {
+      const colors = {
+        info: 'text-slate-600 dark:text-slate-300',
+        success: 'text-emerald-600 dark:text-emerald-400',
+        error: 'text-red-600 dark:text-red-400',
+        muted: 'text-slate-400 dark:text-slate-500',
+      };
+      const item = document.createElement('div');
+      item.className = `rounded-xl px-3 py-1.5 ${colors[tone] || colors.info} bg-slate-50 dark:bg-slate-900 border border-slate-100 dark:border-slate-850`;
+      item.textContent = message;
+      els.voiceLog.prepend(item);
+      while (els.voiceLog.children.length > 8) {
+        els.voiceLog.removeChild(els.voiceLog.lastChild);
+      }
+    }
+
+    function setLoading(button, spinner, loading) {
+      button.disabled = loading;
+      if (spinner) spinner.classList.toggle('hidden', !loading);
+      if (els.sendBtnIcon) els.sendBtnIcon.classList.toggle('hidden', loading);
+      button.classList.toggle('opacity-70', loading);
+    }
+
+    function autoResize(textarea) {
+      textarea.style.height = 'auto';
+      textarea.style.height = `${Math.min(textarea.scrollHeight, 144)}px`;
+    }
+
+    function setActiveView(view) {
+      state.activeView = view;
+      document.querySelectorAll('[data-panel]').forEach((panel) => {
+        const tokens = (panel.getAttribute('data-panel') || '').split(/\s+/).filter(Boolean);
+        const show = view === 'dashboard' || tokens.includes(view);
+        panel.classList.toggle('hidden', !show);
+      });
+
+      document.querySelectorAll('.nav-btn').forEach((button) => {
+        const isActive = button.dataset.nav === view;
+        button.classList.toggle('bg-brand', isActive);
+        button.classList.toggle('text-white', isActive);
+        button.classList.toggle('bg-slate-100', !isActive);
+        button.classList.toggle('dark:bg-slate-800', !isActive);
+      });
+
+      if (view === 'voice') {
+        resizeVoiceCanvas();
+      }
+    }
+
+    function resizeVoiceCanvas() {
+      const canvas = els.voiceWaveform;
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(250, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(56, Math.floor(rect.height * dpr));
+    }
+
+    function drawVoiceWaveform() {
+      const canvas = els.voiceWaveform;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      const draw = () => {
+        const width = canvas.width;
+        const height = canvas.height;
+        ctx.clearRect(0, 0, width, height);
+
+        const analyzer = state.voice.analyserNode;
+        if (!analyzer) {
+          ctx.fillStyle = 'rgba(128, 134, 139, 0.2)';
+          ctx.fillRect(0, height / 2 - 1, width, 2);
+          state.voice.waveformFrame = requestAnimationFrame(draw);
+          return;
+        }
+
+        const dataArray = new Uint8Array(analyzer.fftSize);
+        analyzer.getByteTimeDomainData(dataArray);
+
+        ctx.lineWidth = 2 * (window.devicePixelRatio || 1);
+        ctx.strokeStyle = '#1a73e8';
+        ctx.beginPath();
+
+        const sliceWidth = width / dataArray.length;
+        let x = 0;
+        let sum = 0;
+
+        for (let i = 0; i < dataArray.length; i += 1) {
+          const v = dataArray[i] / 128.0;
+          const y = (v * height) / 2;
+          sum += Math.abs(v - 1);
+          if (i === 0) {
+            ctx.moveTo(x, y);
+          } else {
+            ctx.lineTo(x, y);
+          }
+          x += sliceWidth;
+        }
+
+        ctx.stroke();
+        const rms = Math.min(1, sum / dataArray.length);
+        setVoiceStatus({ level: rms });
+        state.voice.waveformFrame = requestAnimationFrame(draw);
+      };
+
+      cancelAnimationFrame(state.voice.waveformFrame);
+      state.voice.waveformFrame = requestAnimationFrame(draw);
+    }
+
+    function stopVoiceWaveform() {
+      if (state.voice.waveformFrame) {
+        cancelAnimationFrame(state.voice.waveformFrame);
+        state.voice.waveformFrame = null;
+      }
+      const canvas = els.voiceWaveform;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
+    }
+
+    function mirrorVoiceMessage(role, content, meta = {}) {
+      const message = {
+        role,
+        content,
+        created_at: new Date().toISOString(),
+        source: meta.source || (role === 'assistant' ? 'local_rule' : undefined),
+        provider: meta.provider || undefined,
+      };
+      state.messages = [...state.messages, message];
+      renderMessages(state.messages);
+      renderHistory(state.messages);
+    }
+
+    function setVoiceStatus(partial) {
+      state.voice = { ...state.voice, ...partial };
+      
+      const recordingActive = state.voice.recording || state.voice.connected;
+      
+      // Gemini Multi-colored wave background visualization on active input bar
+      if (els.geminiWaves) {
+        if (recordingActive) {
+          els.geminiWaves.classList.remove('hidden');
+        } else {
+          els.geminiWaves.classList.add('hidden');
+        }
+      }
+
+      // Mic Button Style Update
+      if (els.micBtn) {
+        if (recordingActive) {
+          els.micBtn.classList.remove('text-red-500', 'dark:text-red-400', 'hover:bg-slate-200', 'dark:hover:bg-slate-800');
+          els.micBtn.classList.add('bg-red-500', 'text-white', 'animate-pulse');
+        } else {
+          els.micBtn.classList.add('text-red-500', 'dark:text-red-400', 'hover:bg-slate-200', 'dark:hover:bg-slate-800');
+          els.micBtn.classList.remove('bg-red-500', 'text-white', 'animate-pulse');
+        }
+      }
+
+      els.voiceConnectionStatus.textContent = state.voice.connected
+        ? (state.voice.recording ? 'Recording' : 'Connected')
+        : 'Disconnected';
+      els.voiceBackendStatus.textContent = state.voice.backend === 'ok'
+        ? 'Ready'
+        : 'Unknown';
+      els.voiceModeBadge.textContent = state.voice.demoMode
+        ? 'Demo Mode'
+        : state.voice.backend === 'ok'
+          ? 'Voice Ready'
+          : 'Offline';
+            
+      els.voiceTranscriptCount.textContent = String(state.voice.transcriptCount);
+      els.voiceResponseCount.textContent = String(state.voice.responseCount);
+      const displayLevel = state.voice.demoMode && state.voice.connected && !state.voice.recording
+        ? Math.max(state.voice.level || 0, 0.12)
+        : state.voice.level || 0;
+      els.voiceLevelText.textContent = `${Math.round(displayLevel * 100)}%`;
+      els.voiceLevelBar.style.width = `${Math.max(4, Math.round(displayLevel * 100))}%`;
+    }
+
+    function base64ToBytes(base64) {
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    function detectMimeType(firstChunkBytes) {
+      if (!firstChunkBytes || firstChunkBytes.length < 4) {
+        return 'audio/mpeg';
+      }
+      const header = String.fromCharCode(
+        firstChunkBytes[0],
+        firstChunkBytes[1],
+        firstChunkBytes[2],
+        firstChunkBytes[3],
+      );
+      if (header === 'RIFF') return 'audio/wav';
+      if (header === 'OggS') return 'audio/ogg';
+      return 'audio/mpeg';
+    }
+
+    function downsampleBuffer(floatBuffer, inputSampleRate, outputSampleRate) {
+      if (outputSampleRate === inputSampleRate || !floatBuffer.length) {
+        return floatBuffer;
+      }
+      if (outputSampleRate > inputSampleRate) {
+        return floatBuffer;
+      }
+
+      const sampleRateRatio = inputSampleRate / outputSampleRate;
+      const newLength = Math.round(floatBuffer.length / sampleRateRatio);
+      const result = new Float32Array(newLength);
+      for (let i = 0; i < newLength; i++) {
+        const srcPos = i * sampleRateRatio;
+        const srcIndex = Math.floor(srcPos);
+        const frac = srcPos - srcIndex;
+        const nextIndex = Math.min(srcIndex + 1, floatBuffer.length - 1);
+        result[i] = floatBuffer[srcIndex] * (1 - frac) + floatBuffer[nextIndex] * frac;
+      }
+
+      return result;
+    }
+
+    function floatTo16BitPCM(floatBuffer) {
+      const output = new Int16Array(floatBuffer.length);
+      for (let i = 0; i < floatBuffer.length; i += 1) {
+        const s = Math.max(-1, Math.min(1, floatBuffer[i]));
+        output[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      return output;
+    }
+
+    function stopAudioPlayback() {
+      if (state.voice.audioPlayQueue) {
+        state.voice.audioPlayQueue = [];
+      }
+      if (state.voice.activeAudio) {
+        state.voice.activeAudio.pause();
+        state.voice.activeAudio = null;
+      }
+      state.voice.isPlayingAudio = false;
+    }
+
+    function processAudioPlayQueue() {
+      if (state.voice.isPlayingAudio) return;
+      if (!state.voice.audioPlayQueue || !state.voice.audioPlayQueue.length) return;
+
+      const chunk = state.voice.audioPlayQueue.shift();
+      const mimeType = detectMimeType(chunk);
+      const audioBlob = new Blob([chunk], { type: mimeType });
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+
+      state.voice.activeAudio = audio;
+      state.voice.isPlayingAudio = true;
+
+      audio.play().catch(() => {
+        state.voice.isPlayingAudio = false;
+        processAudioPlayQueue();
+      });
+
+      audio.addEventListener('ended', () => {
+        URL.revokeObjectURL(audioUrl);
+        if (state.voice.activeAudio === audio) {
+          state.voice.activeAudio = null;
+          state.voice.isPlayingAudio = false;
+          processAudioPlayQueue();
+        }
+      }, { once: true });
+
+      audio.addEventListener('error', () => {
+        URL.revokeObjectURL(audioUrl);
+        if (state.voice.activeAudio === audio) {
+          state.voice.activeAudio = null;
+          state.voice.isPlayingAudio = false;
+          processAudioPlayQueue();
+        }
+      }, { once: true });
+    }
+
+    function cleanupVoiceResources() {
+      if (state.voice.sendTimer) {
+        clearInterval(state.voice.sendTimer);
+        state.voice.sendTimer = null;
+      }
+      if (state.voice.waveformFrame) {
+        cancelAnimationFrame(state.voice.waveformFrame);
+        state.voice.waveformFrame = null;
+      }
+      stopAudioPlayback();
+      if (state.voice.analyserNode) {
+        state.voice.analyserNode.disconnect();
+        state.voice.analyserNode = null;
+      }
+      if (state.voice.processorNode) {
+        state.voice.processorNode.disconnect();
+        state.voice.processorNode.onaudioprocess = null;
+        state.voice.processorNode = null;
+      }
+      if (state.voice.sourceNode) {
+        state.voice.sourceNode.disconnect();
+        state.voice.sourceNode = null;
+      }
+      if (state.voice.gainNode) {
+        state.voice.gainNode.disconnect();
+        state.voice.gainNode = null;
+      }
+      if (state.voice.audioContext) {
+        state.voice.audioContext.close().catch(() => {});
+        state.voice.audioContext = null;
+      }
+      if (state.voice.mediaStream) {
+        state.voice.mediaStream.getTracks().forEach((track) => track.stop());
+        state.voice.mediaStream = null;
+      }
+      if (state.voice.websocket) {
+        try {
+          state.voice.websocket.close();
+        } catch {
+          // ignore
+        }
+        state.voice.websocket = null;
+      }
+      setVoiceStatus({
+        connected: false,
+        recording: false,
+        demoMode: false,
+        level: 0,
+        floatBuffer: [],
+        pendingResponseChunks: [],
+        audioPlayQueue: [],
+        isPlayingAudio: false,
+        speaking: false,
+        silenceStart: null,
+      });
+      stopVoiceWaveform();
+    }
+
+    function flushVoiceAudio() {
+      const voice = state.voice;
+      if (!voice.websocket || voice.websocket.readyState !== WebSocket.OPEN) return;
+      if (!voice.audioContext || !voice.floatBuffer.length) return;
+      if (!voice.recording) {
+        voice.floatBuffer = [];
+        return;
+      }
+
+      const inputSampleRate = voice.audioContext.sampleRate;
+      const targetSampleRate = 16000;
+      const floatBuffer = new Float32Array(voice.floatBuffer);
+      voice.floatBuffer = [];
+
+      const downsampled = downsampleBuffer(floatBuffer, inputSampleRate, targetSampleRate);
+      const pcm16 = floatTo16BitPCM(downsampled);
+      const bytes = new Uint8Array(pcm16.buffer);
+      if (bytes.length > 0) {
+        voice.websocket.send(bytes);
+      }
+    }
+
+    async function loadVoiceHealth() {
+      try {
+        const response = await apiFetch('/voice/health');
+        setVoiceStatus({
+          backend: response.status || 'unknown',
+          whisperLoaded: Boolean(response.whisper_loaded),
+          vadLoaded: Boolean(response.vad_loaded),
+        });
+        appendVoiceLog(
+          `Backend connection status: ${response.status}`,
+          response.status === 'ok' ? 'success' : 'muted'
+        );
+        return response;
+      } catch (error) {
+        setVoiceStatus({ backend: 'unknown' });
+        appendVoiceLog(`Health check failure: ${error.message}`, 'error');
+        return null;
+      }
+    }
+
+    async function syncVoiceUser(phoneNumber) {
+      try {
+        await loadUsers();
+        const voiceEmail = `${phoneNumber}@example.com`;
+        const voiceUser = state.users.find((user) => (user.email || '').toLowerCase() === voiceEmail.toLowerCase());
+        if (voiceUser) {
+          state.currentUser = voiceUser;
+          els.userSelect.value = String(voiceUser.id);
+          els.userName.value = voiceUser.name;
+          els.userEmail.value = voiceUser.email || '';
+          await loadHistory(voiceUser.id);
+        }
+      } catch {
+        // no-op
+      }
+    }
+
+    function ensureVoicePhoneNumber() {
+      return els.voicePhoneNumber.value.trim();
+    }
+
+    async function sendVoiceDemoTranscript() {
+      const phoneNumber = ensureVoicePhoneNumber();
+      const transcript = els.voiceDemoTranscript.value.trim();
+      if (!transcript) {
+        showToast('Please type mock speech text.', 'error');
+        return;
+      }
+
+      setVoiceStatus({
+        demoMode: true,
+        phoneNumber,
+        connected: true,
+        recording: false,
+      });
+
+      try {
+        appendVoiceLog('Sending mock simulation...', 'muted');
+        mirrorVoiceMessage('user', transcript);
+
+        const response = await apiFetch('/chat', {
+          method: 'POST',
+          body: JSON.stringify({
+            user_name: phoneNumber || 'Demo Caller',
+            message: transcript,
+          }),
+        });
+
+        state.voice.responseCount += 1;
+        state.voice.transcriptCount += 1;
+        setVoiceStatus({
+          responseCount: state.voice.responseCount,
+          transcriptCount: state.voice.transcriptCount,
+        });
+        mirrorVoiceMessage('assistant', response.assistant_reply, {
+          source: response.source || 'local_rule',
+          provider: response.provider || 'Local Rule Engine',
+        });
+        appendVoiceLog(`Response: ${response.assistant_reply}`, 'success');
+        showToast('Simulation complete.', 'success');
+        await loadUsers();
+        if (phoneNumber) {
+          await syncVoiceUser(phoneNumber);
+        }
+      } catch (error) {
+        appendVoiceLog(`Mock failed: ${error.message}`, 'error');
+        showToast(error.message || 'Mock failed.', 'error');
+      }
+    }
+
+    async function startVoiceSession() {
+      const phoneNumber = ensureVoicePhoneNumber();
+      const demoMode = Boolean(els.voiceDemoMode.checked);
+
+      const health = await loadVoiceHealth();
+      if (!demoMode && (!health || !health.whisper_loaded)) {
+        showToast('Voice engine loading. Please wait...', 'error');
+        return;
+      }
+
+      cleanupVoiceResources();
+      setVoiceStatus({
+        backend: state.voice.backend || 'unknown',
+        phoneNumber,
+        demoMode,
+      });
+
+      if (demoMode) {
+        appendVoiceLog('Running demo mode.', 'muted');
+        showToast('Mock session initiated.', 'success');
+        setVoiceStatus({
+          demoMode: true,
+          connected: true,
+          recording: false,
+        });
+        await sendVoiceDemoTranscript();
+        return;
+      }
+
+      if (!navigator.mediaDevices?.getUserMedia) {
+        appendVoiceLog('No microphone input device found.', 'error');
+        showToast('Microphone error.', 'error');
+        setVoiceStatus({
+          demoMode: true,
+          connected: true,
+          recording: false,
+        });
+        return;
+      }
+
+      try {
+        const mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        let audioContext;
+        try {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        } catch {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioContext.state === 'suspended') {
+          await audioContext.resume();
+        }
+        const sourceNode = audioContext.createMediaStreamSource(mediaStream);
+        const processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+        const analyserNode = audioContext.createAnalyser();
+        const gainNode = audioContext.createGain();
+        gainNode.gain.value = 0;
+        analyserNode.fftSize = 256;
+
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = phoneNumber
+          ? `${wsProtocol}//${window.location.host}${API_BASE}/voice/stream?phone_number=${encodeURIComponent(phoneNumber)}`
+          : `${wsProtocol}//${window.location.host}${API_BASE}/voice/stream`;
+        const websocket = new WebSocket(wsUrl);
+        websocket.binaryType = 'arraybuffer';
+
+        state.voice = {
+          ...state.voice,
+          phoneNumber,
+          mediaStream,
+          audioContext,
+          sourceNode,
+          processorNode,
+          analyserNode,
+          gainNode,
+          websocket,
+          floatBuffer: [],
+          pendingResponseChunks: [],
+          recording: true,
+          connected: false,
+          speaking: false,
+          silenceStart: null,
+        };
+        setVoiceStatus({ backend: state.voice.backend, recording: true, connected: false, phoneNumber });
+        appendVoiceLog('Connecting to stream socket...', 'muted');
+
+        sourceNode.connect(analyserNode);
+        sourceNode.connect(processorNode);
+        processorNode.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+        resizeVoiceCanvas();
+        drawVoiceWaveform();
+
+        let consecutiveBargeInFrames = 0;
+
+        processorNode.onaudioprocess = (event) => {
+          if (!state.voice.recording) return;
+          const input = event.inputBuffer.getChannelData(0);
+          
+          let sum = 0;
+          for (let i = 0; i < input.length; i++) {
+            sum += input[i] * input[i];
+          }
+          const rms = Math.sqrt(sum / input.length);
+
+          // Update volume meter UI
+          const pct = Math.min(100, Math.round(rms * 500));
+          if (els.voiceLevelText) els.voiceLevelText.textContent = `${pct}%`;
+          if (els.voiceLevelBar) els.voiceLevelBar.style.width = `${Math.max(4, pct)}%`;
+
+          // Acoustic Echo Protected Barge-in:
+          // When AI is actively playing audio through laptop speakers, the mic picks up acoustic feedback.
+          // Require elevated RMS (>= 0.08) across 4 consecutive frames (~1s of loud sustained speech)
+          // to trigger client-side interrupt, preventing speaker playback from cutting off the AI voice.
+          if (state.voice.activeAudio || state.voice.isPlayingAudio) {
+            if (rms >= 0.08) {
+              consecutiveBargeInFrames += 1;
+              if (consecutiveBargeInFrames >= 4) {
+                consecutiveBargeInFrames = 0;
+                stopAudioPlayback();
+                if (state.voice.websocket && state.voice.websocket.readyState === WebSocket.OPEN) {
+                  state.voice.websocket.send(JSON.stringify({ type: 'interrupt' }));
+                }
+              }
+            } else {
+              consecutiveBargeInFrames = Math.max(0, consecutiveBargeInFrames - 1);
+            }
+          } else {
+            consecutiveBargeInFrames = 0;
+          }
+
+          // Continuously stream all audio chunks to authoritative backend TurnDetector
+          state.voice.floatBuffer.push(...input);
+        };
+
+        websocket.onopen = () => {
+          setVoiceStatus({ connected: true, recording: true });
+          appendVoiceLog('Socket online. Listening for voice...', 'success');
+          state.voice.sendTimer = setInterval(flushVoiceAudio, 100);
+        };
+
+        websocket.onmessage = (event) => {
+          const payload = JSON.parse(event.data);
+          if (payload.type === 'listening') {
+            // Keep status clean
+          } else if (payload.type === 'transcript') {
+            setTyping(false);
+            state.voice.transcriptCount += 1;
+            setVoiceStatus({ transcriptCount: state.voice.transcriptCount });
+            appendVoiceLog(`Voice input: "${payload.data}"`, 'info');
+            mirrorVoiceMessage('user', payload.data);
+          } else if (payload.type === 'response_start') {
+            setTyping(true);
+            state.voice.responseCount += 1;
+            setVoiceStatus({ responseCount: state.voice.responseCount });
+            if (payload.data) {
+              appendVoiceLog(`Bot reply: ${payload.data}`, 'success');
+              mirrorVoiceMessage('assistant', payload.data);
+            }
+          } else if (payload.type === 'audio_chunk') {
+            const chunkBytes = base64ToBytes(payload.data);
+            state.voice.audioPlayQueue = state.voice.audioPlayQueue || [];
+            state.voice.audioPlayQueue.push(chunkBytes);
+            processAudioPlayQueue();
+          } else if (payload.type === 'voice_interrupted') {
+            setTyping(false);
+            stopAudioPlayback();
+            appendVoiceLog('Interrupted by user speech.', 'muted');
+          } else if (payload.type === 'response_end') {
+            setTyping(false);
+            if (payload.data) {
+              const isAi = payload.source === 'ai_llm';
+              appendVoiceLog(`Bot reply: ${payload.data} [${isAi ? 'AI Call' : 'Local Rule'}]`, 'success');
+              mirrorVoiceMessage('assistant', payload.data, {
+                source: payload.source || 'local_rule',
+                provider: payload.provider || 'Local Rule Engine',
+              });
+            }
+            syncVoiceUser(phoneNumber);
+          } else if (payload.type === 'goodbye') {
+            appendVoiceLog('Session completed.', 'muted');
+            cleanupVoiceResources();
+          } else if (payload.type === 'timeout') {
+            appendVoiceLog('Stream connection timed out.', 'muted');
+            cleanupVoiceResources();
+          } else if (payload.type === 'no_speech') {
+            setTyping(false);
+            appendVoiceLog(payload.data || 'No clear speech detected.', 'muted');
+          } else if (payload.type === 'error') {
+            setTyping(false);
+            appendVoiceLog(`Error message: ${payload.data}`, 'error');
+            showToast(payload.data, 'error');
+          }
+        };
+
+        websocket.onerror = () => {
+          appendVoiceLog('Voice socket error.', 'error');
+          cleanupVoiceResources();
+        };
+
+        websocket.onclose = () => {
+          cleanupVoiceResources();
+        };
+
+        showToast('Voice session active.', 'success');
+      } catch (error) {
+        if (error?.name === 'NotAllowedError' || /permission denied/i.test(error?.message || '')) {
+          appendVoiceLog('Microphone blocked. Demo fallback active.', 'error');
+          showToast('Mic permission required. Running mock instead.', 'error');
+          els.voiceDemoMode.checked = true;
+          setVoiceStatus({
+            demoMode: true,
+            connected: true,
+            recording: false,
+            phoneNumber,
+          });
+          await sendVoiceDemoTranscript();
+          return;
+        }
+        cleanupVoiceResources();
+        showToast('WebSocket voice connection failure.', 'error');
+      }
+    }
+
+    function stopVoiceSession() {
+      if (state.voice.websocket && state.voice.websocket.readyState === WebSocket.OPEN) {
+        appendVoiceLog('Stop clicked. Processing audio...', 'info');
+        flushVoiceAudio();
+        state.voice.websocket.send(JSON.stringify({ type: 'speech_ended' }));
+      }
+      // Stop recording audio input without killing the websocket connection prematurely
+      state.voice.recording = false;
+      setVoiceStatus({ recording: false });
+      if (state.voice.processorNode) {
+        try {
+          state.voice.processorNode.disconnect();
+          state.voice.processorNode.onaudioprocess = null;
+        } catch {}
+      }
+      if (state.voice.mediaStream) {
+        try {
+          state.voice.mediaStream.getTracks().forEach((track) => track.stop());
+        } catch {}
+      }
+      showToast('Voice recording stopped. Transcribing...', 'info');
+    }
+
+    async function apiFetch(path, options = {}) {
+      const response = await fetch(`${API_BASE}${path}`, {
+        headers: {
+          'Content-Type': 'application/json',
+          ...(options.headers || {}),
+        },
+        ...options,
+      });
+
+      let data = null;
+      try {
+        data = await response.json();
+      } catch {
+        data = null;
+      }
+
+      if (!response.ok) {
+        const detail = data?.detail;
+        const message = Array.isArray(detail)
+          ? detail.map(item => item.msg || JSON.stringify(item)).join(', ')
+          : detail || 'Network request failed';
+        throw new Error(message);
+      }
+
+      return data;
+    }
+
+    function renderUsers() {
+      els.userSelect.innerHTML = `
+        <option value="">New User</option>
+        ${state.users.map(user => `<option value="${user.id}">${escapeHtml(user.name)}</option>`).join('')}
+      `;
+
+      els.activeUsers.innerHTML = state.users.length
+        ? state.users.map(user => `
+            <button data-user-id="${user.id}" class="user-pill w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-2 text-left hover:bg-slate-50 dark:hover:bg-slate-800/50 transition flex items-center gap-2">
+              <span class="h-2 w-2 rounded-full bg-emerald-500 shrink-0"></span>
+              <div class="min-w-0 flex-1">
+                <div class="font-bold text-xs truncate">${escapeHtml(user.name)}</div>
+                <div class="text-[10px] text-slate-400 truncate">${escapeHtml(user.email || 'No email')}</div>
+              </div>
+            </button>
+          `).join('')
+        : '<div class="rounded-xl border border-dashed border-slate-200 dark:border-slate-800 p-4 text-xs text-slate-400 text-center">No active users yet.</div>';
+
+      els.onlineCount.textContent = `${state.users.length} active`;
+      els.totalUsers.textContent = state.users.length;
+      els.totalChats.textContent = state.users.reduce((sum, user) => sum + (user.chat_count || 0), 0);
+    }
+
+    function renderUserCard() {
+      if (!state.currentUser) {
+        els.userCard.innerHTML = `<div class="rounded-xl border border-dashed border-slate-200 dark:border-slate-800 p-4 text-xs text-slate-400 text-center">No contact loaded.</div>`;
+        return;
+      }
+      els.userCard.innerHTML = `
+        <div class="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/30 p-3 space-y-1.5 text-xs">
+          <div>
+            <div class="font-bold text-sm text-slate-800 dark:text-white">${escapeHtml(state.currentUser.name)}</div>
+            <div class="text-[11px] text-slate-400 truncate mt-0.5">${escapeHtml(state.currentUser.email || 'No email')}</div>
+          </div>
+          <div class="grid grid-cols-2 gap-1.5 pt-1 text-[10px]">
+            <div class="rounded-lg bg-white dark:bg-slate-900 p-2 border border-slate-200 dark:border-slate-850">
+              <div class="text-slate-400">User ID</div>
+              <div class="font-bold mt-0.5">${state.currentUser.id}</div>
+            </div>
+            <div class="rounded-lg bg-white dark:bg-slate-900 p-2 border border-slate-200 dark:border-slate-850">
+              <div class="text-slate-400">Created</div>
+              <div class="font-bold mt-0.5">${formatTime(state.currentUser.created_at)}</div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderMessages(messages) {
+      els.messages.innerHTML = messages.length
+        ? messages.map(renderMessageBubble).join('')
+        : `<div class="flex h-full items-center justify-center text-slate-400 dark:text-slate-500 py-24 w-full">
+             <div class="text-center max-w-sm">
+               <div class="text-2xl font-bold text-slate-800 dark:text-slate-100 tracking-tight">Concierge AI Receptionist</div>
+               <div class="text-xs mt-1.5 text-slate-500 leading-normal">Start chatting below, or toggle the microphone to establish a real-time speech dialogue.</div>
+             </div>
+           </div>`;
+      els.messages.scrollTop = els.messages.scrollHeight;
+    }
+
+    function renderMessageBubble(message) {
+      const isUser = message.role === 'user';
+      const align = isUser ? 'justify-end' : 'justify-start';
+      
+      const bubble = isUser
+        ? 'bg-[#d2e3fc] dark:bg-[#1a73e8] text-slate-900 dark:text-white rounded-2xl rounded-tr-sm shadow-sm'
+        : 'bg-[#f1f3f4] dark:bg-[#303134] text-slate-900 dark:text-slate-100 rounded-2xl rounded-tl-sm shadow-sm';
+        
+      const label = isUser ? 'You' : 'AI Receptionist';
+
+      let badgeHtml = '';
+      if (!isUser) {
+        const source = message.source || '';
+        const provider = message.provider || '';
+        if (source === 'ai_llm' || provider.toLowerCase().includes('groq') || provider.toLowerCase().includes('ai')) {
+          badgeHtml = `
+            <span class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[9px] font-semibold tracking-normal bg-purple-100 text-purple-700 dark:bg-purple-900/60 dark:text-purple-300 border border-purple-200 dark:border-purple-700/60 shadow-xs" title="Generated via LLM API Call (${escapeHtml(provider || 'Groq AI')})">
+              <svg class="w-2.5 h-2.5 fill-current" viewBox="0 0 24 24"><path d="M12 2L14.4 7.6L20 10L14.4 12.4L12 18L9.6 12.4L4 10L9.6 7.6L12 2Z"/></svg>
+              <span>Generated by AI</span>
+            </span>
+          `;
+        } else if (source === 'fallback') {
+          badgeHtml = `
+            <span class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[9px] font-semibold tracking-normal bg-amber-100 text-amber-700 dark:bg-amber-900/60 dark:text-amber-300 border border-amber-200 dark:border-amber-700/60 shadow-xs">
+              <span>⚠️ System Fallback</span>
+            </span>
+          `;
+        } else {
+          badgeHtml = `
+            <span class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[9px] font-semibold tracking-normal bg-emerald-100 text-emerald-700 dark:bg-emerald-900/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-700/60 shadow-xs" title="Answered instantly by Local Rule Engine (No API Call • $0 Cost)">
+              <svg class="w-2.5 h-2.5 stroke-current stroke-2 fill-none" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+              <span>General Rule (No API)</span>
+            </span>
+          `;
+        }
+      }
+
+      return `
+        <div class="bubble-in flex ${align} w-full">
+          <div class="max-w-[85%] ${bubble} px-4 py-3">
+            <div class="flex items-center justify-between gap-3 text-[10px] uppercase tracking-wider ${isUser ? 'text-slate-600 dark:text-white/70' : 'text-slate-500'} font-bold mb-1">
+              <div class="flex items-center gap-2">
+                <span>${label}</span>
+                ${badgeHtml}
+              </div>
+              <span class="text-[9px] font-medium opacity-80">${formatTime(message.created_at)}</span>
+            </div>
+            <div class="mt-1 text-sm leading-6 whitespace-pre-wrap">${escapeHtml(message.content)}</div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderHistory(history) {
+      els.historyPanel.innerHTML = history.length
+        ? history.map(item => {
+            const isUser = item.role === 'user';
+            const badge = !isUser
+              ? (item.source === 'ai_llm'
+                  ? '<span class="text-[9px] font-bold text-purple-600 dark:text-purple-400">✨ AI Call</span>'
+                  : '<span class="text-[9px] font-bold text-emerald-600 dark:text-emerald-400">⚡ Local Rule</span>')
+              : '';
+            return `
+            <div class="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5 bg-white dark:bg-slate-900">
+              <div class="flex items-center justify-between text-[10px] text-slate-400 font-bold uppercase">
+                <div class="flex items-center gap-1.5">
+                  <span>${item.role}</span>
+                  ${badge}
+                </div>
+                <span>${formatTime(item.created_at)}</span>
+              </div>
+              <p class="mt-1 text-xs text-slate-600 dark:text-slate-350 leading-relaxed">${escapeHtml(item.content)}</p>
+            </div>
+          `;
+          }).join('')
+        : '<div class="rounded-xl border border-dashed border-slate-200 dark:border-slate-800 p-4 text-xs text-slate-400 text-center">No logs loaded.</div>';
+    }
+
+    function setTyping(active) {
+      els.typingState.classList.toggle('hidden', !active);
+      els.typingState.classList.toggle('flex', active);
+    }
+
+    async function loadUsers() {
+      const users = await apiFetch('/users');
+      state.users = Array.isArray(users) ? users : [];
+      renderUsers();
+    }
+
+    async function loadHistory(userId) {
+      if (!userId) {
+        state.currentUser = null;
+        state.messages = [];
+        renderUserCard();
+        renderMessages([]);
+        renderHistory([]);
+        return;
+      }
+      const user = state.users.find(item => String(item.id) === String(userId));
+      state.currentUser = user || null;
+      renderUserCard();
+      const history = await apiFetch(`/users/${userId}/history`);
+      state.messages = history;
+      renderMessages(state.messages);
+      renderHistory(history);
+    }
+
+    async function handleSendMessage() {
+      const message = els.messageInput.value.trim();
+      const userName = els.userName.value.trim();
+      const userEmail = els.userEmail.value.trim();
+      const userId = els.userSelect.value || '';
+
+      if (!message) return;
+
+      setLoading(els.sendBtn, els.sendSpinner, true);
+      setTyping(true);
+
+      try {
+        const payload = {
+          message,
+          user_name: userName || state.currentUser?.name || 'Guest',
+          user_email: userEmail || state.currentUser?.email || null,
+        };
+        if (userId) payload.user_id = Number(userId);
+
+        const response = await apiFetch('/chat', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+
+        await loadUsers();
+        state.currentUser = response.user;
+        els.userSelect.value = String(response.user.id);
+        els.userName.value = response.user.name;
+        els.userEmail.value = response.user.email || '';
+
+        state.messages = [
+          ...state.messages,
+          { role: 'user', content: response.user_message, created_at: new Date().toISOString() },
+          {
+            role: 'assistant',
+            content: response.assistant_reply,
+            created_at: response.created_at,
+            source: response.source || 'local_rule',
+            provider: response.provider || 'Local Rule Engine',
+          },
+        ];
+        renderMessages(state.messages);
+        renderUserCard();
+        renderHistory(state.messages);
+        els.messageInput.value = '';
+        autoResize(els.messageInput);
+      } catch (error) {
+        showToast(error.message, 'error');
+      } finally {
+        setLoading(els.sendBtn, els.sendSpinner, false);
+        setTyping(false);
+      }
+    }
+
+    async function handleGenerateReview() {
+      const reviewText = els.reviewInput.value.trim();
+      if (!reviewText) {
+        showToast('Please type a customer review.', 'error');
+        return;
+      }
+      setLoading(els.generateReviewBtn, els.reviewSpinner, true);
+      try {
+        const response = await apiFetch('/review-reply', {
+          method: 'POST',
+          body: JSON.stringify({ review_text: reviewText }),
+        });
+        state.reviewReply = response.reply;
+        els.reviewReply.textContent = response.reply;
+        showToast('Review reply created.', 'success');
+      } catch (error) {
+        els.reviewReply.textContent = 'Reply failure.';
+        showToast(error.message, 'error');
+      } finally {
+        setLoading(els.generateReviewBtn, els.reviewSpinner, false);
+      }
+    }
+
+    async function copyReviewReply() {
+      if (!state.reviewReply) {
+        showToast('No reply found.', 'error');
+        return;
+      }
+      await navigator.clipboard.writeText(state.reviewReply);
+      showToast('Copied.', 'success');
+    }
+
+    function setQuickPrompt(text) {
+      els.messageInput.value = text;
+      els.messageInput.focus();
+      autoResize(els.messageInput);
+    }
+
+    function bindEvents() {
+      els.themeToggle.addEventListener('click', () => applyTheme(state.theme === 'dark' ? 'light' : 'dark'));
+      
+      // Sidebar Toggles
+      els.sidebarToggle.addEventListener('click', () => {
+        els.sidebar.classList.toggle('hidden');
+        resizeVoiceCanvas();
+      });
+
+      // Microphone Button Toggle
+      els.micBtn.addEventListener('click', () => {
+        if (state.voice.recording || state.voice.connected) {
+          stopVoiceSession();
+        } else {
+          startVoiceSession();
+        }
+      });
+
+      els.sendBtn.addEventListener('click', handleSendMessage);
+      els.generateReviewBtn.addEventListener('click', handleGenerateReview);
+      els.copyReviewBtn.addEventListener('click', copyReviewReply);
+      els.startVoiceBtn.addEventListener('click', startVoiceSession);
+      els.stopVoiceBtn.addEventListener('click', stopVoiceSession);
+      els.sendVoiceDemoBtn.addEventListener('click', sendVoiceDemoTranscript);
+      
+      els.clearHistoryBtn.addEventListener('click', () => {
+        els.messages.innerHTML = '';
+        showToast('History views cleared.', 'info');
+      });
+
+      els.messageInput.addEventListener('input', () => autoResize(els.messageInput));
+      els.messageInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && !event.shiftKey) {
+          event.preventDefault();
+          handleSendMessage();
+        }
+      });
+
+      els.userSelect.addEventListener('change', async (event) => {
+        const userId = event.target.value;
+        if (!userId) {
+          state.currentUser = null;
+          els.userName.value = '';
+          els.userEmail.value = '';
+          state.messages = [];
+          renderUserCard();
+          renderMessages([]);
+          renderHistory([]);
+          return;
+        }
+        try {
+          const user = await apiFetch(`/users/${userId}`);
+          state.currentUser = user;
+          els.userName.value = user.name;
+          els.userEmail.value = user.email || '';
+          await loadHistory(userId);
+        } catch (error) {
+          showToast(error.message, 'error');
+        }
+      });
+
+      els.loadHistoryBtn.addEventListener('click', async () => {
+        const userId = els.userSelect.value;
+        if (!userId) {
+          showToast('Select user.', 'error');
+          return;
+        }
+        try {
+          await loadHistory(userId);
+          showToast('Loaded.', 'success');
+        } catch (error) {
+          showToast(error.message, 'error');
+        }
+      });
+
+      els.newConversationBtn.addEventListener('click', () => {
+        els.userSelect.value = '';
+        els.userName.value = '';
+        els.userEmail.value = '';
+        state.currentUser = null;
+        state.messages = [];
+        renderUserCard();
+        renderMessages([]);
+        renderHistory([]);
+        showToast('Conversation cleared.', 'info');
+      });
+
+      document.getElementById('navMenu').addEventListener('click', (event) => {
+        const button = event.target.closest('[data-nav]');
+        if (!button) return;
+        setActiveView(button.dataset.nav);
+      });
+
+      document.body.addEventListener('click', async (event) => {
+        const userButton = event.target.closest('.user-pill');
+        if (!userButton) return;
+        const userId = userButton.dataset.userId;
+        els.userSelect.value = String(userId);
+        const user = await apiFetch(`/users/${userId}`);
+        state.currentUser = user;
+        els.userName.value = user.name;
+        els.userEmail.value = user.email || '';
+        await loadHistory(userId);
+      });
+
+      els.quickGreeting.addEventListener('click', () => setQuickPrompt('Hello, welcome to our business! How can I help you today?'));
+      els.quickBooking.addEventListener('click', () => setQuickPrompt('I would like to book an appointment for this week.'));
+      els.quickReview.addEventListener('click', () => {
+        els.reviewInput.value = 'Amazing service, fast response, and very professional team.';
+        autoResize(els.reviewInput);
+      });
+      els.quickThanks.addEventListener('click', () => {
+        els.reviewInput.value = 'Thank you for your outstanding support and excellent communication.';
+        autoResize(els.reviewInput);
+      });
+    }
+
+    async function init() {
+      applyTheme(state.theme);
+      bindEvents();
+      setActiveView('dashboard');
+      window.addEventListener('resize', () => {
+        if (state.voice.analyserNode) {
+          resizeVoiceCanvas();
+        }
+      });
+      autoResize(els.messageInput);
+      autoResize(els.reviewInput);
+      await loadVoiceHealth();
+      setInterval(loadVoiceHealth, 20000);
+      renderMessages([]);
+      
+      // Add custom chat history placeholder inside Dev Sidebar Panel
+      const histPanel = document.createElement('div');
+      histPanel.id = 'historyPanel';
+      histPanel.className = 'space-y-2 max-h-48 overflow-y-auto scrollbar pr-1 mt-1';
+      document.querySelector('section.space-y-2:last-of-type').appendChild(histPanel);
+      els.historyPanel = histPanel;
+
+      renderHistory([]);
+      try {
+        await loadUsers();
+      } catch (error) {
+        showToast(error.message, 'error');
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>
