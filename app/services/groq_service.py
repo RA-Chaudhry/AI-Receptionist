@@ -16,8 +16,10 @@ def get_shared_client() -> httpx.AsyncClient:
     global _shared_client
     if _shared_client is None or _shared_client.is_closed:
         limits = httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=60.0)
-        timeout = httpx.Timeout(30.0, connect=5.0)
+        timeout = httpx.Timeout(15.0, connect=3.0, read=6.0)
         try:
+            # Check for h2 dependency before enabling HTTP/2
+            import h2  # noqa: F401
             _shared_client = httpx.AsyncClient(
                 timeout=timeout,
                 limits=limits,
@@ -105,18 +107,26 @@ class GroqService:
             "Content-Type": "application/json",
         }
         url = f"{self.base_url}/chat/completions"
-        client = get_shared_client()
 
-        try:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-        except httpx.HTTPStatusError as exc:
-            logger.exception("Groq API returned an error")
-            raise GroqServiceError("Groq API request failed.") from exc
-        except httpx.RequestError as exc:
-            logger.exception("Could not reach Groq API")
-            raise GroqServiceError("Unable to connect to Groq API.") from exc
+        for attempt in range(2):
+            client = get_shared_client()
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+                if response.status_code >= 400:
+                    logger.warning("Groq API returned HTTP status_code=%d", response.status_code)
+                    raise GroqServiceError(f"Groq API error with status {response.status_code}")
+                data = response.json()
+                break
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout) as exc:
+                if attempt == 0:
+                    logger.warning("Groq connection failed, resetting shared client and retrying once: %s", type(exc).__name__)
+                    await close_shared_client()
+                    continue
+                logger.warning("Groq connection failed on retry: %s", type(exc).__name__)
+                raise GroqServiceError("Unable to connect to Groq API.") from exc
+            except httpx.HTTPStatusError as exc:
+                logger.warning("Groq API returned HTTP status_code=%d", exc.response.status_code)
+                raise GroqServiceError(f"Groq API request failed with status {exc.response.status_code}.") from exc
 
         try:
             content = data["choices"][0]["message"]["content"].strip()
@@ -146,37 +156,56 @@ class GroqService:
             "Content-Type": "application/json",
         }
         url = f"{self.base_url}/chat/completions"
-        client = get_shared_client()
+        yielded_any = False
 
-        try:
-            async with client.stream("POST", url, json=payload, headers=headers) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data_str = line[len("data:"):].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(data_str)
-                        choices = data.get("choices")
-                        if choices:
-                            delta = choices[0].get("delta", {})
-                            # Yield ONLY delta.content (ignore reasoning fields)
-                            content = delta.get("content")
-                            if content:
-                                yield content
-                    except Exception:
-                        continue
-        except GeneratorExit:
-            return
-        except httpx.HTTPStatusError as exc:
-            logger.exception("Groq API streaming returned an error")
-            raise GroqServiceError("Groq API streaming failed.") from exc
-        except httpx.RequestError as exc:
-            logger.exception("Could not reach Groq API for streaming")
-            raise GroqServiceError("Unable to connect to Groq API streaming.") from exc
+        for attempt in range(2):
+            client = get_shared_client()
+            try:
+                async with client.stream("POST", url, json=payload, headers=headers) as response:
+                    if response.status_code >= 400:
+                        logger.warning("Groq API streaming returned HTTP status_code=%d", response.status_code)
+                        raise GroqServiceError(f"Groq API error with status {response.status_code}")
+
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[len("data:"):].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            choices = data.get("choices")
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                # Explicitly yield ONLY delta.content — never reasoning fields
+                                content = delta.get("content")
+                                if content:
+                                    yielded_any = True
+                                    yield content
+                        except Exception:
+                            continue
+                return  # Success
+            except GeneratorExit:
+                return
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout) as exc:
+                if attempt == 0 and not yielded_any:
+                    logger.warning("Groq stream connection error, retrying once: %s", type(exc).__name__)
+                    await close_shared_client()
+                    continue
+                logger.warning("Groq stream connection error on attempt %d: %s", attempt, type(exc).__name__)
+                break
+            except httpx.HTTPStatusError as exc:
+                logger.warning("Groq API streaming HTTP error: status_code=%d", exc.response.status_code)
+                break
+            except Exception as exc:
+                logger.warning("Groq streaming failed: %s", type(exc).__name__)
+                break
+
+        # If stream failed without yielding any token, yield clean fallback sentence
+        if not yielded_any:
+            fallback = "I apologize, but I am currently experiencing connectivity issues. Please ask again or let me know how I can help."
+            yield fallback
 
     async def transcribe_audio_with_usage(
         self,
@@ -206,22 +235,25 @@ class GroqService:
         else:
             data["prompt"] = "Logic Pulse AI Receptionist: Appointments, timings, services in English, Urdu, Roman Urdu."
 
-        client = get_shared_client()
-        try:
-            response = await client.post(url, headers=headers, files=files, data=data)
-            response.raise_for_status()
-            res_json = response.json()
-            text = res_json.get("text", "").strip()
-            lang = res_json.get("language", "unknown")
-            duration = float(res_json.get("duration", 0.0))
-            return text, lang, duration
-        except httpx.HTTPStatusError as exc:
-            logger.exception("Groq Whisper API returned an error")
-            raise GroqServiceError("Groq Whisper transcription failed.") from exc
-        except httpx.RequestError as exc:
-            logger.exception("Could not reach Groq Whisper API")
-            raise GroqServiceError("Unable to connect to Groq Whisper API.") from exc
-
-
-
-
+        for attempt in range(2):
+            client = get_shared_client()
+            try:
+                response = await client.post(url, headers=headers, files=files, data=data)
+                if response.status_code >= 400:
+                    logger.warning("Groq Whisper API returned HTTP status_code=%d", response.status_code)
+                    raise GroqServiceError(f"Groq Whisper transcription failed with status {response.status_code}")
+                res_json = response.json()
+                text = res_json.get("text", "").strip()
+                lang = res_json.get("language", "unknown")
+                duration = float(res_json.get("duration", 0.0))
+                return text, lang, duration
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout) as exc:
+                if attempt == 0:
+                    logger.warning("Groq Whisper connection error, retrying once: %s", type(exc).__name__)
+                    await close_shared_client()
+                    continue
+                logger.warning("Groq Whisper connection failed: %s", type(exc).__name__)
+                raise GroqServiceError("Unable to connect to Groq Whisper API.") from exc
+            except httpx.HTTPStatusError as exc:
+                logger.warning("Groq Whisper HTTP error: status_code=%d", exc.response.status_code)
+                raise GroqServiceError(f"Groq Whisper transcription failed with status {exc.response.status_code}") from exc
