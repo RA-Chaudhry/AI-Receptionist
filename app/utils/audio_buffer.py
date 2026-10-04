@@ -432,7 +432,10 @@ class TurnDetector:
         max_turn_bytes = int(self.sample_rate * (self.max_turn_duration_ms / 1000.0) * 2)
 
         for frame in frames:
-            is_frame_speech = self.vad_processor.is_speech(frame, update_noise=(self.state == TurnState.IDLE))
+            try:
+                is_frame_speech = self.vad_processor.is_speech(frame, update_noise=(self.state == TurnState.IDLE))
+            except TypeError:
+                is_frame_speech = self.vad_processor.is_speech(frame)
             if is_frame_speech:
                 overall_is_speech = True
 

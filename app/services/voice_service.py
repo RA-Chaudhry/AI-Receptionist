@@ -864,12 +864,23 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
 
                 elif event_type == "speech_ended":
                     logger.info("Speech ended received from client.")
-                    # If TurnDetector has no active utterance, the turn was already completed by server VAD
-                    if not turn_detector._active_utterance:
-                        logger.debug("Ignored speech_ended event: turn already processed by server VAD.")
+                    # If a generation task is already running and no new speech was buffered,
+                    # this is a redundant trailing event from client for the turn server VAD just launched.
+                    if (
+                        current_generation_task
+                        and not current_generation_task.done()
+                        and not turn_detector._active_utterance
+                        and not turn_detector._pending_speech_frames
+                    ):
+                        logger.debug("Ignored redundant speech_ended event: server VAD already triggered generation.")
                         continue
 
-                    pcm_to_process = bytes(turn_detector._active_utterance)
+                    buffered_audio = (
+                        bytes(turn_detector._active_utterance)
+                        or b"".join(turn_detector._pending_speech_frames)
+                        or b"".join(turn_detector._pre_buffer)
+                        or (b"\x00\x00" * 320)
+                    )
                     turn_detector.reset()
                     client_listening_sent = False
 
@@ -887,7 +898,7 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                         assistant_is_speaking = False
 
                     current_generation_task = asyncio.create_task(
-                        _run_generation_flow(pcm_to_process, turn_recorder)
+                        _run_generation_flow(buffered_audio, turn_recorder)
                     )
 
     finally:
@@ -917,6 +928,10 @@ async def send_vonage_sms(to_phone: str, body: str) -> str:
     Sends an SMS using Vonage SMS REST API.
     Returns status: 'sent', 'failed', 'rate_limited', or 'disabled'.
     """
+    if getattr(settings, "demo_mode", False) and not getattr(settings, "enable_sms_in_demo", False):
+        logger.info("DEMO_MODE=true: Outbound SMS sending suppressed for demo safety.")
+        return "disabled"
+
     if not settings.vonage_api_key or not settings.vonage_api_secret or not settings.vonage_from_number:
         logger.warning("Vonage SMS credentials are not fully configured.")
         return "disabled"

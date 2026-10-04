@@ -23,6 +23,18 @@ logger = logging.getLogger(__name__)
 
 TELEMETRY_LOG_FILE = os.getenv("TELEMETRY_LOG_FILE", "logs/telemetry.jsonl")
 
+from collections import deque
+_recent_turn_totals: deque[float] = deque(maxlen=5)
+
+
+def get_recent_turn_totals() -> list[float]:
+    return list(_recent_turn_totals)
+
+
+def record_turn_total(total_ms: float) -> None:
+    if total_ms > 0:
+        _recent_turn_totals.append(round(total_ms, 1))
+
 
 def get_telemetry_log_file() -> str:
     """Returns the effective telemetry log file path or 'disabled'."""
@@ -558,6 +570,10 @@ class VoiceTelemetryRecorder:
             self.latency.turn_completed_time = time.perf_counter()
         self.cost.calculate_estimated_cost()
         budget_eval = self.latency.evaluate_budget(DEFAULT_LATENCY_BUDGET)
+
+        tot = self.latency.total_from_speech_end_ms or self.latency.total_turn_duration_ms
+        if tot is not None and tot > 0:
+            record_turn_total(tot)
 
         # Sanity guards: Check for implausible latencies on STT+LLM turns
         path_val = self.path or (
