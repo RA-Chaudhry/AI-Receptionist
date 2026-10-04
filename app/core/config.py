@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     groq_model: str = "llama-3.1-8b-instant"
     groq_base_url: str = "https://api.groq.com/openai/v1"
     llm_max_tokens: int = 200
-    short_memory_messages: int = 6
+    short_memory_messages: int = 12
     allowed_origins: str = "http://127.0.0.1:8000,http://localhost:8000"
     rate_limit_requests: int = 120
     rate_limit_window_seconds: int = 60

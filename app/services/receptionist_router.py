@@ -331,9 +331,9 @@ def _extract_context_from_history(history: List[Dict[str, str]]) -> Dict[str, Op
             ):
                 ctx["awaiting_confirmation"] = "phone"
                 active_awaiting_entity = "phone"
-            elif "what day" in content_lower or "which day" in content_lower:
+            elif "what day" in content_lower or "which day" in content_lower or "preferred day" in content_lower or "day and time" in content_lower or "schedule an appointment" in content_lower or "book your appointment" in content_lower:
                 active_awaiting_entity = "day"
-            elif "what time" in content_lower or "which time" in content_lower:
+            elif "what time" in content_lower or "which time" in content_lower or "time would you prefer" in content_lower or "time between" in content_lower:
                 active_awaiting_entity = "time"
             else:
                 ctx["awaiting_confirmation"] = False
@@ -549,9 +549,18 @@ class ReceptionistRouter:
             query,
         ))
 
+        has_prior_booking_context = (
+            selected_day is not None or
+            selected_time_hour is not None or
+            awaiting_confirmation or
+            ctx.get("awaiting_entity") in ("day", "time", "phone", "confirmation")
+        )
+
         is_booking_intent = (
             has_booking_keywords or
             (_has_day and _has_time) or
+            (_has_day and has_prior_booking_context) or
+            (_has_time and has_prior_booking_context) or
             (_has_day and selected_time_hour is not None) or
             (_has_time and selected_day is not None) or
             (_has_day and awaiting_confirmation) or

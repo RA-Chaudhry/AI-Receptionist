@@ -709,6 +709,9 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
             if full_response:
                 session_history.append({"role": "user", "content": transcript})
                 session_history.append({"role": "assistant", "content": full_response})
+                max_history = getattr(settings, "short_memory_messages", 12)
+                if len(session_history) > max_history:
+                    del session_history[:-max_history]
                 asyncio.create_task(
                     save_chat_message(
                         user_id=user.id,
@@ -1124,6 +1127,9 @@ async def process_vonage_websocket(websocket: WebSocket) -> None:
             if full_bot_text:
                 session_history.append({"role": "user", "content": transcript})
                 session_history.append({"role": "assistant", "content": full_bot_text})
+                max_history = getattr(settings, "short_memory_messages", 12)
+                if len(session_history) > max_history:
+                    del session_history[:-max_history]
                 asyncio.create_task(
                     save_chat_message(
                         user_id=user.id,
