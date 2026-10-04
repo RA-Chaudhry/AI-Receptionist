@@ -77,6 +77,44 @@ GREETING_TEXT = "Hello, thank you for calling Logic Pulse. This is Pulse Concier
 FILLER_CLIPS = ["Ji,", "Ek second,", "Sure,"]
 
 
+def is_exit_phrase(text: str) -> bool:
+    """
+    Evaluates whether an utterance is an intentional exit/goodbye command.
+    Uses word boundaries and ensures the call isn't ended on substrings (e.g. 'maybe')
+    or when 'bye' is embedded in a longer conversational query (e.g. 'can you say bye later').
+    """
+    if not text:
+        return False
+    cleaned = re.sub(r"[^\w\s]", " ", text.strip().lower())
+    words = cleaned.split()
+    if not words or len(words) > 5:
+        return False
+
+    # Conversational or question indicators
+    if any(q in words for q in ("can", "could", "why", "what", "how", "when", "if", "say", "saying", "mean", "world", "tell", "ask")):
+        return False
+
+    exact_phrases = {
+        "bye", "goodbye", "good bye", "bye bye", "exit", "quit",
+        "ok bye", "okay bye", "bye now", "goodbye now", "thanks bye",
+        "thank you bye", "allah hafiz", "khuda hafiz", "alvida",
+        "goodbye have a nice day", "goodbye and thank you", "goodbye sir", "bye sir", "bye madam"
+    }
+    cleaned_phrase = " ".join(words)
+    if cleaned_phrase in exact_phrases:
+        return True
+
+    # 1 or 2 words with explicit exit token
+    if len(words) <= 2:
+        return bool(re.search(r"\b(goodbye|bye|exit|quit|allah\s*hafiz|khuda\s*hafiz|alvida)\b", cleaned_phrase))
+
+    # 3 words with conversational polite wrapper
+    if len(words) == 3 and any(w in ("ok", "okay", "thank", "thanks", "sir", "madam", "now", "see") for w in words):
+        return bool(re.search(r"\b(goodbye|bye|exit|quit)\b", cleaned_phrase))
+
+    return False
+
+
 async def _safe_send_json(websocket: WebSocket, payload: dict) -> None:
     try:
         await websocket.send_json(payload)
@@ -529,8 +567,7 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
             assistant_is_speaking = True
             await _safe_send_json(websocket, {"type": "transcript", "data": transcript})
 
-            transcript_lower = transcript.lower()
-            if any(word in transcript_lower for word in ["goodbye", "bye", "exit"]):
+            if is_exit_phrase(transcript):
                 await _safe_send_json(websocket, {"type": "goodbye", "data": "Goodbye!"})
                 assistant_is_speaking = False
                 recorder.finalize()
@@ -1052,8 +1089,7 @@ async def process_vonage_websocket(websocket: WebSocket) -> None:
                 recorder.log_latency_summary()
                 return
 
-            transcript_lower = transcript.lower()
-            if any(word in transcript_lower for word in ["goodbye", "bye", "exit"]):
+            if is_exit_phrase(transcript):
                 farewell = "Goodbye! Have a nice day."
                 await play_vonage_audio(farewell, recorder)
                 recorder.finalize()
