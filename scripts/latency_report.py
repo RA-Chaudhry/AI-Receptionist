@@ -193,9 +193,41 @@ def analyze_latencies(records: List[Dict[str, Any]]) -> None:
     print("=" * 80)
 
 
+import argparse
+
+
 def main() -> None:
-    log_file = sys.argv[1] if len(sys.argv) > 1 else "logs/telemetry.jsonl"
-    records = load_telemetry_records(log_file)
+    parser = argparse.ArgumentParser(description="Analyze AI Receptionist telemetry logs.")
+    parser.add_argument("file", nargs="?", default="logs/telemetry.jsonl", help="Path to telemetry JSONL log file")
+    parser.add_argument("--channel", type=str, default=None, help="Filter by channel (e.g. voice_ws, vonage_voice)")
+    parser.add_argument("--source", type=str, default=None, help="Filter by source (e.g. ai_llm, local_rule, tool_service)")
+    parser.add_argument("--exclude-mock", dest="exclude_mock", action="store_true", default=True, help="Exclude mock/test turns (default: True)")
+    parser.add_argument("--include-mock", dest="exclude_mock", action="store_false", help="Include mock/test turns")
+
+    args = parser.parse_args()
+    records = load_telemetry_records(args.file)
+
+    if args.exclude_mock:
+        records = [r for r in records if not (r.get("metadata") or {}).get("mock", False)]
+
+    if args.channel:
+        records = [r for r in records if r.get("channel") == args.channel]
+
+    if args.source:
+        def match_source(r: Dict[str, Any]) -> bool:
+            cost = r.get("cost", {})
+            provider = cost.get("provider", "")
+            turn_id = r.get("turn_id", "")
+            if args.source == "local_rule":
+                return provider in ("local_router", "regex_rules") or "greeting" in turn_id
+            elif args.source == "tool_service":
+                return provider == "tool_service"
+            elif args.source == "ai_llm":
+                return provider not in ("local_router", "regex_rules", "tool_service") and "greeting" not in turn_id
+            return True
+
+        records = [r for r in records if match_source(r)]
+
     analyze_latencies(records)
 
 

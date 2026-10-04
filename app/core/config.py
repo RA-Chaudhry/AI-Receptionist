@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     resend_api_key: str = ""
     from_email: str = "noreply@logicpulse.com"
 
+    # Telemetry and VAD / Barge-In Configuration
+    telemetry_log_file: str = "logs/telemetry.jsonl"
+    barge_in_guard_ms: int = 300
+    barge_in_min_speech_ms: int = 200
+    demo_mode: bool = False
+
     # SMS Configuration
     sms_rate_limit_count: int = 5
     sms_rate_limit_window_seconds: int = 300

@@ -205,3 +205,17 @@ def mock_voice_environment(monkeypatch):
     return {
         "whisper": fake_whisper,
     }
+
+
+@pytest.fixture(autouse=True)
+def isolate_telemetry_logs(tmp_path: Path, monkeypatch):
+    """
+    Prevents tests from polluting logs/telemetry.jsonl by directing all
+    telemetry log writes to a temporary directory for each test run.
+    """
+    test_log_file = str(tmp_path / "test_telemetry.jsonl")
+    monkeypatch.setenv("TELEMETRY_LOG_FILE", test_log_file)
+    monkeypatch.setenv("TESTING", "true")
+    monkeypatch.setattr("app.core.config.settings.telemetry_log_file", test_log_file, raising=False)
+    monkeypatch.setattr("app.services.telemetry.TELEMETRY_LOG_FILE", test_log_file, raising=False)
+    yield test_log_file

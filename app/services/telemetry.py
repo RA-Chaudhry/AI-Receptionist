@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -20,7 +21,22 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
-TELEMETRY_LOG_FILE = "logs/telemetry.jsonl"
+TELEMETRY_LOG_FILE = os.getenv("TELEMETRY_LOG_FILE", "logs/telemetry.jsonl")
+
+
+def get_telemetry_log_file() -> str:
+    """Returns the effective telemetry log file path or 'disabled'."""
+    global TELEMETRY_LOG_FILE
+    if TELEMETRY_LOG_FILE:
+        return TELEMETRY_LOG_FILE
+    env_val = os.getenv("TELEMETRY_LOG_FILE")
+    if env_val is not None:
+        return env_val
+    try:
+        from app.core.config import settings
+        return getattr(settings, "telemetry_log_file", "logs/telemetry.jsonl")
+    except Exception:
+        return "logs/telemetry.jsonl"
 
 
 class LatencyBudget(BaseModel):
@@ -312,6 +328,7 @@ class VoiceTelemetryRecorder:
         self.request_id = request_id or str(uuid4())
         self.turn_id = turn_id or self.request_id
         self.channel = channel
+        self.path: str = "llm"
         self.latency = LatencyTrace(turn_created_time=time.perf_counter())
         self.cost = CostTrace(call_id=self.call_id, request_id=self.request_id)
         
@@ -337,6 +354,8 @@ class VoiceTelemetryRecorder:
         self.interrupt_reason: Optional[str] = None
         
         self.metadata: Dict[str, Any] = {}
+        if os.getenv("TESTING", "").lower() in ("true", "1") or "pytest" in sys.modules:
+            self.metadata["mock"] = True
         self._finalized = False
 
     # ── High-resolution timestamp setters (time.perf_counter) ─────────────────
@@ -440,6 +459,13 @@ class VoiceTelemetryRecorder:
 
     def log_latency_summary(self) -> None:
         m = self.latency.get_metrics_summary()
+        path_val = self.path or (
+            "router"
+            if self.cost.provider in ("local_router", "regex_rules") or "greeting" in self.turn_id
+            else ("tool" if self.cost.provider == "tool_service" else "llm")
+        )
+        stt_provider = self.stt_provider or "faster_whisper"
+        llm_model = self.cost.model or "llama-3.1-8b-instant"
         endpointing_ms = m.get("endpointing_delay_ms") or 0.0
         stt_ms = m.get("stt_latency_ms") or 0.0
         llm_first_token_ms = m.get("llm_ttft_ms") or 0.0
@@ -448,8 +474,13 @@ class VoiceTelemetryRecorder:
         send_ms = m.get("send_ms") or 0.0
         total_from_speech_end_ms = m.get("total_from_speech_end_ms") or 0.0
         audio_len_s = self.audio_duration_sec or 0.0
+        transcript_len = self.transcript_length or 0
+
         logger.info(
-            "LATENCY endpointing_ms=%.1f, stt_ms=%.1f, llm_first_token_ms=%.1f, first_clause_ms=%.1f, tts_first_byte_ms=%.1f, send_ms=%.1f, total_from_speech_end_ms=%.1f, audio_len_s=%.2f",
+            "LATENCY path=%s, stt_provider=%s, llm_model=%s, endpointing_ms=%.1f, stt_ms=%.1f, llm_first_token_ms=%.1f, first_clause_ms=%.1f, tts_first_byte_ms=%.1f, send_ms=%.1f, total_from_speech_end_ms=%.1f, audio_len_s=%.2f, transcript_len=%d",
+            path_val,
+            stt_provider,
+            llm_model,
             endpointing_ms,
             stt_ms,
             llm_first_token_ms,
@@ -458,16 +489,8 @@ class VoiceTelemetryRecorder:
             send_ms,
             total_from_speech_end_ms,
             audio_len_s,
+            transcript_len,
         )
-
-    def mark_frontend_playback_start(self) -> None:
-        self.latency.frontend_playback_start_time = time.perf_counter()
-
-    def mark_frontend_playback_end(self) -> None:
-        self.latency.frontend_playback_end_time = time.perf_counter()
-
-    def mark_turn_completed(self) -> None:
-        self.latency.turn_completed_time = time.perf_counter()
 
     def record_interrupt(self, reason: str = "user_speech") -> None:
         self.interrupt_detected = True
@@ -536,6 +559,36 @@ class VoiceTelemetryRecorder:
         self.cost.calculate_estimated_cost()
         budget_eval = self.latency.evaluate_budget(DEFAULT_LATENCY_BUDGET)
 
+        # Sanity guards: Check for implausible latencies on STT+LLM turns
+        path_val = self.path or (
+            "router"
+            if self.cost.provider in ("local_router", "regex_rules") or "greeting" in self.turn_id
+            else ("tool" if self.cost.provider == "tool_service" else "llm")
+        )
+        if path_val == "llm" and (self.latency.stt_start_time is not None or self.latency.llm_start_time is not None):
+            if not self.metadata.get("mock"):
+                ep_ms = self.latency.endpointing_delay_ms or 0.0
+                tot_ms = self.latency.total_from_speech_end_ms or 0.0
+                if ep_ms < 100.0 or tot_ms < 300.0:
+                    logger.warning(
+                        "implausible latency: endpointing_delay_ms=%.1f (<100ms) or total_from_speech_end_ms=%.1f (<300ms) for STT+LLM turn. "
+                        "Raw timestamps: vad_start=%.4f, vad_end=%.4f, speech_end=%.4f, stt_start=%.4f, stt_end=%.4f, "
+                        "llm_start=%.4f, llm_first_token=%.4f, first_clause=%.4f, tts_start=%.4f, tts_first_audio=%.4f, audio_sent=%.4f",
+                        ep_ms,
+                        tot_ms,
+                        self.latency.vad_start_time or 0.0,
+                        self.latency.vad_end_time or 0.0,
+                        self.latency.speech_end_time or 0.0,
+                        self.latency.stt_start_time or 0.0,
+                        self.latency.stt_end_time or 0.0,
+                        self.latency.llm_start_time or 0.0,
+                        self.latency.llm_first_token_time or 0.0,
+                        self.latency.first_clause_time or 0.0,
+                        self.latency.tts_start_time or 0.0,
+                        self.latency.tts_first_audio_time or 0.0,
+                        self.latency.audio_sent_time or 0.0,
+                    )
+
         telemetry_record = TurnTelemetry(
             call_id=self.call_id,
             request_id=self.request_id,
@@ -568,8 +621,11 @@ class VoiceTelemetryRecorder:
         return telemetry_record
 
     def _write_to_log(self, record: TurnTelemetry) -> None:
+        log_file = get_telemetry_log_file()
+        if not log_file or log_file.lower() == "disabled":
+            return
         try:
-            log_dir = os.path.dirname(TELEMETRY_LOG_FILE)
+            log_dir = os.path.dirname(log_file)
             if log_dir:
                 os.makedirs(log_dir, exist_ok=True)
             
@@ -577,7 +633,7 @@ class VoiceTelemetryRecorder:
             # Include computed latency helpers in log output for instant observability
             entry["metrics_summary"] = self.latency.get_metrics_summary()
 
-            with open(TELEMETRY_LOG_FILE, "a", encoding="utf-8") as f:
+            with open(log_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
         except Exception as exc:
             logger.warning(f"Failed to write telemetry log: {exc}")
