@@ -565,11 +565,13 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
     turn_detector = TurnDetector()
     current_generation_task: asyncio.Task | None = None
     assistant_is_speaking = False
+    assistant_speaking_started_at: float = 0.0
     active_recorder: VoiceTelemetryRecorder | None = None
     client_listening_sent = False
+    loop = asyncio.get_running_loop()
 
     async def _run_generation_flow(pcm_to_process: bytes, recorder: VoiceTelemetryRecorder):
-        nonlocal assistant_is_speaking
+        nonlocal assistant_is_speaking, assistant_speaking_started_at
         try:
             transcript = await transcribe_audio_bytes(pcm_to_process, telemetry_recorder=recorder, call_id=call_id)
             if not transcript.strip():
@@ -580,6 +582,7 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                 return
 
             assistant_is_speaking = True
+            assistant_speaking_started_at = loop.time()
             await _safe_send_json(websocket, {"type": "transcript", "data": transcript})
 
             if is_exit_phrase(transcript):
@@ -797,10 +800,14 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                 if turn_result.turn_started:
                     # Audio-driven Barge-in: only interrupt if assistant is actively speaking/streaming audio
                     if assistant_is_speaking and current_generation_task and not current_generation_task.done():
-                        current_generation_task.cancel()
-                        assistant_is_speaking = False
-                        logger.info("Barge-in: Interrupted ongoing voice generation task via audio VAD.")
-                        await _safe_send_json(websocket, {"type": "voice_interrupted"})
+                        guard_ms = getattr(settings, "barge_in_guard_ms", 300)
+                        time_since_speech_ms = (loop.time() - assistant_speaking_started_at) * 1000.0
+                        # Ignore barge-in for first BARGE_IN_GUARD_MS (speaker echo protection)
+                        if time_since_speech_ms >= guard_ms:
+                            current_generation_task.cancel()
+                            assistant_is_speaking = False
+                            logger.info("Barge-in: Interrupted ongoing voice generation task via audio VAD.")
+                            await _safe_send_json(websocket, {"type": "voice_interrupted"})
 
                     if active_recorder is None:
                         active_recorder = VoiceTelemetryRecorder(call_id=call_id, channel="voice_ws")
@@ -857,8 +864,12 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
 
                 elif event_type == "speech_ended":
                     logger.info("Speech ended received from client.")
-                    # Use TurnDetector's bounded utterance only (or fallback to pre_buffer if empty)
-                    pcm_to_process = bytes(turn_detector._active_utterance) if turn_detector._active_utterance else (b"".join(turn_detector._pre_buffer) or b"\x00\x00" * 320)
+                    # If TurnDetector has no active utterance, the turn was already completed by server VAD
+                    if not turn_detector._active_utterance:
+                        logger.debug("Ignored speech_ended event: turn already processed by server VAD.")
+                        continue
+
+                    pcm_to_process = bytes(turn_detector._active_utterance)
                     turn_detector.reset()
                     client_listening_sent = False
 

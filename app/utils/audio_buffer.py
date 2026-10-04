@@ -123,15 +123,28 @@ class VADProcessor:
         return (total / sample_count) ** 0.5
 
     def update_noise_floor(self, rms: float) -> None:
-        """Adapts estimated background noise floor."""
-        if rms <= 0:
+        """
+        Adapts estimated background noise floor during non-speech/idle frames.
+        Clamped between 20.0 and 400.0 RMS so user speech cannot be learned as noise.
+        """
+        MAX_NOISE_FLOOR = 400.0
+        MIN_NOISE_FLOOR = 20.0
+        if rms <= 0 or rms > MAX_NOISE_FLOOR:
             return
         if rms < self.noise_floor:
-            self.noise_floor = self.noise_floor * 0.8 + rms * 0.2
+            self.noise_floor = max(MIN_NOISE_FLOOR, self.noise_floor * 0.8 + rms * 0.2)
         else:
-            self.noise_floor = self.noise_floor * 0.995 + rms * 0.005
+            self.noise_floor = min(MAX_NOISE_FLOOR, self.noise_floor * 0.995 + rms * 0.005)
 
-    def is_speech(self, pcm_bytes: bytes, override_threshold_rms: float | None = None) -> bool:
+    def reset_noise_floor(self) -> None:
+        self.noise_floor = 40.0
+
+    def is_speech(
+        self,
+        pcm_bytes: bytes,
+        override_threshold_rms: float | None = None,
+        update_noise: bool = True,
+    ) -> bool:
         if not pcm_bytes:
             return False
 
@@ -139,6 +152,8 @@ class VADProcessor:
         effective_threshold = override_threshold_rms or max(self.min_rms, self.noise_floor * 2.5)
 
         if self.vad is None:
+            if rms < effective_threshold and update_noise:
+                self.update_noise_floor(rms)
             return rms >= effective_threshold
 
         # Accept 20ms (640 bytes) or 30ms (960 bytes) frames at 16kHz
@@ -161,7 +176,7 @@ class VADProcessor:
                 # Strict condition: both VAD model AND energy threshold must agree
                 if is_vad_speech and (frame_rms >= effective_threshold):
                     speech_frames += 1
-                else:
+                elif update_noise:
                     self.update_noise_floor(frame_rms)
             except Exception:
                 logger.debug("VAD frame processing failed", exc_info=True)
@@ -417,7 +432,7 @@ class TurnDetector:
         max_turn_bytes = int(self.sample_rate * (self.max_turn_duration_ms / 1000.0) * 2)
 
         for frame in frames:
-            is_frame_speech = self.vad_processor.is_speech(frame)
+            is_frame_speech = self.vad_processor.is_speech(frame, update_noise=(self.state == TurnState.IDLE))
             if is_frame_speech:
                 overall_is_speech = True
 
@@ -481,6 +496,11 @@ class TurnDetector:
 
                 # Max turn duration guard
                 if len(self._active_utterance) >= max_turn_bytes:
+                    logger.warning(
+                        "Turn ended by max turn duration guard (limit=%ds / %d bytes). Utterance truncated.",
+                        int(self.max_turn_duration_ms / 1000),
+                        max_turn_bytes,
+                    )
                     turn_completed_flag = True
                     endpointing_delay = 0.0
                     completed_audio = bytes(self._active_utterance)
