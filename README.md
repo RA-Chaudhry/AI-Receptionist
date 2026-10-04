@@ -75,6 +75,40 @@ http://127.0.0.1:8000/docs
 - Dockerfile and `docker-compose.yml`
 - Pytest coverage for API flow
 
+## Real-Time Voice Configuration & Low-Latency Tuning
+
+The AI receptionist includes an ultra-low-latency real-time voice pipeline (WebSockets + Vonage VoIP) with Groq LLM streaming, Groq Whisper / Faster-Whisper STT, and Edge-TTS pipelining.
+
+### Key Environment Variables
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `STT_PROVIDER` | `groq_whisper` | STT engine (`groq_whisper` or `faster_whisper`). |
+| `GROQ_MODEL` | `llama-3.1-8b-instant` | Groq LLM model for real-time speech dialogue. |
+| `LLM_MAX_TOKENS` | `200` | Max generation tokens per turn. |
+| `VAD_AGGRESSIVENESS` | `2` | WebRTC VAD aggressiveness mode (0–3). |
+| `VAD_MIN_RMS` | `100.0` | Minimum audio RMS energy threshold for speech detection. |
+| `VAD_SILENCE_DURATION_MS` | `350` | Trailing silence window required to endpoint speech turn. |
+| `VAD_PRE_BUFFER_MS` | `200` | Audio pre-buffering duration before detected speech onset. |
+| `VAD_POST_BUFFER_MS` | `150` | Maximum trailing silence preserved for STT context. |
+| `TTS_VOICE` | `en-US-JennyNeural` | Edge-TTS voice model. |
+
+### Measuring Latency & Telemetry Reports
+
+Run the latency report utility against recorded session logs:
+
+```bash
+python scripts/latency_report.py
+```
+
+Prints p50 and p95 timings across all pipeline stages:
+- **Endpointing Delay:** Silence duration before turn detection.
+- **STT:** Speech-to-text transcription latency.
+- **LLM TTFT:** Time to first token.
+- **First Clause:** Time until first sentence/clause punctuation chunk.
+- **TTS TTFB:** Time to first synthesized audio byte.
+- **TTFA:** Time from user speech end to first audio byte played/sent.
+
 ## Database Migration
 
 ```bash
@@ -98,3 +132,4 @@ docker compose up --build
 - Tables are created automatically on startup.
 - The chatbot keeps a short memory from recent chat history.
 - The review reply endpoint does not store messages by default.
+

@@ -199,7 +199,9 @@ def mock_voice_environment(monkeypatch):
     """
     fake_whisper = FakeWhisperModel()
     monkeypatch.setattr("app.services.voice_service._whisper_model", fake_whisper)
+    monkeypatch.setattr("app.services.voice_service._get_whisper_model", lambda: fake_whisper)
     monkeypatch.setattr("edge_tts.Communicate", FakeTTSCommunicate)
+    monkeypatch.setattr("app.core.config.settings.stt_provider", "faster_whisper")
     return {
         "whisper": fake_whisper,
     }

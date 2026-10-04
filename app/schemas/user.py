@@ -1,11 +1,11 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr
+from pydantic import BaseModel, ConfigDict
 
 
 class UserBase(BaseModel):
     name: str
-    email: EmailStr | None = None
+    email: str | None = None
 
 
 class UserCreate(UserBase):

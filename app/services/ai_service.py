@@ -2,15 +2,97 @@ import logging
 import re
 from typing import TYPE_CHECKING, AsyncGenerator
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.crud.user import user_crud
+from app.db.session import async_session_maker
+from app.schemas.tools import CreateAppointmentRequest
 from app.services.groq_service import GroqService
+from app.services.receptionist_router import (
+    ReceptionistRouter,
+    _extract_context_from_history,
+    hour_to_display,
+    normalise_input,
+)
+from app.services.tools_service import AppointmentToolService
 from app.utils.prompts import receptionist_prompt
-from app.services.receptionist_router import ReceptionistRouter
 from app.utils.stream_utils import stream_sentence_chunks
 
 if TYPE_CHECKING:
     from app.services.telemetry import VoiceTelemetryRecorder
 
 logger = logging.getLogger(__name__)
+
+
+async def _execute_confirmed_appointment(
+    query: str,
+    history: list[dict[str, str]],
+    user_name: str,
+    user_email: str,
+    user_id: int | None = None,
+    db: AsyncSession | None = None,
+) -> str | None:
+    """
+    Checks if the conversation is awaiting confirmation and the user provided explicit confirmation.
+    If complete appointment details (day, hour, phone) exist, executes AppointmentToolService.create_appointment
+    and returns the authoritative user-facing result.
+    """
+    ctx = _extract_context_from_history(history)
+    if ctx.get("appointment_booked"):
+        return None
+    if ctx.get("awaiting_confirmation") != "appointment" and ctx.get("awaiting_entity") != "confirmation":
+        return None
+
+    norm_query = normalise_input(query).lower()
+    is_cancel = bool(re.search(r"\b(no|cancel|different|change|another|stop|nahi|نہیں|نا|منسوخ|کینسل)\b|نہیں|منسوخ", norm_query))
+    if is_cancel:
+        return None
+
+    is_confirm = bool(
+        re.search(
+            r"\b(yes|confirm|i confirm|go ahead|proceed|ok|okay|sure|please submit|submit it|submit|please book|book it|correct|good|sounds good|haan|ji haan|theek hai|kardein|ہاں|جی ہاں|جی|ٹھیک ہے|درست|بک کریں|جمع کرائیں)\b|ہاں|جی ہاں|ٹھیک ہے|درست|بک کریں",
+            norm_query,
+        )
+    )
+    if not is_confirm:
+        return None
+
+    day = ctx.get("selected_day")
+    hour = ctx.get("selected_time_hour")
+    phone = ctx.get("phone_number")
+
+    if not day or hour is None or not phone:
+        return None
+
+    time_disp = hour_to_display(hour)
+    req = CreateAppointmentRequest(
+        customer_name=user_name or "Valued Client",
+        customer_phone=str(phone),
+        customer_email=user_email,
+        day=str(day),
+        time_str=time_disp,
+        service="General Consultation",
+    )
+
+    if db is not None:
+        actual_user_id = user_id
+        if actual_user_id is None:
+            db_user = await user_crud.get_by_email(db, user_email)
+            if not db_user:
+                db_user = await user_crud.create(db, name=user_name or "Valued Client", email=user_email)
+            actual_user_id = db_user.id
+        tool_res = await AppointmentToolService.create_appointment(req=req, user_id=actual_user_id, db=db)
+        return tool_res.user_facing_message
+
+    async with async_session_maker() as session:
+        actual_user_id = user_id
+        if actual_user_id is None:
+            db_user = await user_crud.get_by_email(session, user_email)
+            if not db_user:
+                db_user = await user_crud.create(session, name=user_name or "Valued Client", email=user_email)
+            actual_user_id = db_user.id
+        tool_res = await AppointmentToolService.create_appointment(req=req, user_id=actual_user_id, db=session)
+        return tool_res.user_facing_message
 
 
 async def get_ai_response_stream(
@@ -20,6 +102,8 @@ async def get_ai_response_stream(
     history: list[dict[str, str]] | None = None,
     system_prompt: str | None = None,
     telemetry_recorder: "VoiceTelemetryRecorder | None" = None,
+    user_id: int | None = None,
+    db: AsyncSession | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Yields sentence-level response chunks incrementally for streaming voice TTS.
@@ -29,6 +113,34 @@ async def get_ai_response_stream(
         telemetry_recorder.mark_llm_start()
 
     history = history or []
+
+    # ── Check appointment confirmation execution ─────────────────────────────
+    tool_reply = await _execute_confirmed_appointment(
+        query=message,
+        history=history,
+        user_name=user_name,
+        user_email=user_email,
+        user_id=user_id,
+        db=db,
+    )
+    if tool_reply is not None:
+        logger.info("ai_service_stream: appointment tool executed on user confirmation.")
+        if telemetry_recorder:
+            telemetry_recorder.record_llm_usage(
+                provider="tool_service",
+                model="create_appointment",
+                input_tokens=0,
+                output_tokens=len(tool_reply.split()),
+            )
+            telemetry_recorder.mark_llm_first_token()
+            telemetry_recorder.mark_llm_end()
+
+        async def _tool_tokens():
+            yield tool_reply
+
+        async for sentence in stream_sentence_chunks(_tool_tokens()):
+            yield sentence
+        return
 
     # ── Layer 1: local router (zero API cost) ─────────────────────────────────
     local_reply = ReceptionistRouter.get_hardcoded_response(
@@ -117,11 +229,34 @@ async def get_ai_response(
     history: list[dict[str, str]] | None = None,
     system_prompt: str | None = None,
     telemetry_recorder: "VoiceTelemetryRecorder | None" = None,
+    user_id: int | None = None,
+    db: AsyncSession | None = None,
 ) -> str:
     if telemetry_recorder:
         telemetry_recorder.mark_llm_start()
 
     history = history or []
+
+    # ── Check appointment confirmation execution ─────────────────────────────
+    tool_reply = await _execute_confirmed_appointment(
+        query=message,
+        history=history,
+        user_name=user_name,
+        user_email=user_email,
+        user_id=user_id,
+        db=db,
+    )
+    if tool_reply is not None:
+        logger.info("ai_service: appointment tool executed on user confirmation.")
+        if telemetry_recorder:
+            telemetry_recorder.record_llm_usage(
+                provider="tool_service",
+                model="create_appointment",
+                input_tokens=0,
+                output_tokens=len(tool_reply.split()),
+            )
+            telemetry_recorder.mark_llm_end()
+        return tool_reply
 
     # ── Layer 1: local router (zero API cost) ─────────────────────────────────
     local_reply = ReceptionistRouter.get_hardcoded_response(

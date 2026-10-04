@@ -13,9 +13,10 @@ from app.api.v1.api import api_router
 from app.api.v1 import voice_ws
 from app.core.config import settings
 from app.core.logging import setup_logging
+import asyncio
 from app.core.middleware import RateLimitMiddleware, SecurityHeadersMiddleware
-from app.services.groq_service import GroqServiceError
-from app.services.voice_service import load_models
+from app.services.groq_service import GroqServiceError, close_shared_client
+from app.services.voice_service import load_models, prewarm_voice_cache
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,9 @@ async def lifespan(app: FastAPI):
     # the one production deployments actually run.
     thread = threading.Thread(target=load_models, daemon=True)
     thread.start()
+    asyncio.create_task(prewarm_voice_cache())
     yield
+    await close_shared_client()
 
 
 setup_logging()

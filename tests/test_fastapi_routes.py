@@ -137,3 +137,24 @@ def test_groq_service_error_handler(client: TestClient, monkeypatch):
     )
     assert response.status_code == 502
     assert "Groq service unreachable" in response.json()["detail"]
+
+
+def test_users_crm_synthetic_voice_email_serialization(client: TestClient, mock_groq):
+    """Verify that users with synthetic voice emails (e.g. @local.invalid or @voice.logicpulse.com) serialize cleanly."""
+    import asyncio
+    from app.crud.user import user_crud
+    from app.db.session import async_session_maker
+
+    async def _seed():
+        async with async_session_maker() as db:
+            await user_crud.create(db, name="Caller 1", email="voice-9cbe84c3287d4fa3d17bfb3a@local.invalid")
+            await user_crud.create(db, name="Caller 2", email="voice-150431c0f1acf080f3be51ec@voice.logicpulse.com")
+
+    asyncio.run(_seed())
+
+    res = client.get("/api/v1/users")
+    assert res.status_code == 200
+    users = res.json()
+    emails = [u["email"] for u in users]
+    assert "voice-9cbe84c3287d4fa3d17bfb3a@local.invalid" in emails
+    assert "voice-150431c0f1acf080f3be51ec@voice.logicpulse.com" in emails

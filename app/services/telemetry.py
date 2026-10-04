@@ -54,25 +54,46 @@ class LatencyTrace(BaseModel):
     audio_received_time: Optional[float] = None
     vad_start_time: Optional[float] = None
     vad_end_time: Optional[float] = None
+    speech_end_time: Optional[float] = None
+    endpointing_delay_time_ms: Optional[float] = None
     stt_start_time: Optional[float] = None
     stt_end_time: Optional[float] = None
     llm_start_time: Optional[float] = None
     llm_first_token_time: Optional[float] = None
+    first_clause_time: Optional[float] = None
     llm_end_time: Optional[float] = None
     tts_start_time: Optional[float] = None
     tts_first_audio_time: Optional[float] = None
     tts_end_time: Optional[float] = None
+    send_start_time: Optional[float] = None
     audio_sent_time: Optional[float] = None
     frontend_playback_start_time: Optional[float] = None
     frontend_playback_end_time: Optional[float] = None
     turn_completed_time: Optional[float] = None
 
     @property
+    def speech_duration_ms(self) -> Optional[float]:
+        """Duration of speech utterance (from vad_start to speech_end)."""
+        end = self.speech_end_time if self.speech_end_time is not None else self.vad_end_time
+        if end is not None and self.vad_start_time is not None:
+            return max(0.0, (end - self.vad_start_time) * 1000.0)
+        return None
+
+    @property
+    def endpointing_delay_ms(self) -> Optional[float]:
+        """Time from actual speech end until VAD silence detection triggers."""
+        if self.endpointing_delay_time_ms is not None:
+            return max(0.0, self.endpointing_delay_time_ms)
+        if self.vad_end_time is not None and self.speech_end_time is not None:
+            return max(0.0, (self.vad_end_time - self.speech_end_time) * 1000.0)
+        return 0.0
+
+    @property
     def vad_latency_ms(self) -> Optional[float]:
-        """Time to detect end-of-turn / silence boundary."""
+        """Backward-compatible alias for speech turn / vad duration."""
         if self.vad_end_time is not None and self.vad_start_time is not None:
             return max(0.0, (self.vad_end_time - self.vad_start_time) * 1000.0)
-        return None
+        return self.speech_duration_ms
 
     @property
     def stt_latency_ms(self) -> Optional[float]:
@@ -97,6 +118,13 @@ class LatencyTrace(BaseModel):
         return None
 
     @property
+    def first_clause_ms(self) -> Optional[float]:
+        """Time to first clause boundary emitted from stream."""
+        if self.first_clause_time is not None and self.llm_start_time is not None:
+            return max(0.0, (self.first_clause_time - self.llm_start_time) * 1000.0)
+        return self.llm_ttft_ms
+
+    @property
     def llm_total_latency_ms(self) -> Optional[float]:
         """Total LLM generation duration."""
         if self.llm_end_time is not None and self.llm_start_time is not None:
@@ -105,7 +133,7 @@ class LatencyTrace(BaseModel):
 
     @property
     def tts_ttfb_ms(self) -> Optional[float]:
-        """Time to first audio chunk from TTS synthesis."""
+        """Time to first audio byte from TTS synthesis."""
         if self.tts_first_audio_time is not None and self.tts_start_time is not None:
             return max(0.0, (self.tts_first_audio_time - self.tts_start_time) * 1000.0)
         return None
@@ -125,15 +153,33 @@ class LatencyTrace(BaseModel):
         return None
 
     @property
+    def send_ms(self) -> Optional[float]:
+        """Alias for network send / buffering duration."""
+        if self.audio_sent_time is not None and self.send_start_time is not None:
+            return max(0.0, (self.audio_sent_time - self.send_start_time) * 1000.0)
+        return self.network_buffering_ms
+
+    @property
     def ttfa_ms(self) -> Optional[float]:
         """
         Time to First Audio (Total turn-around latency):
-        From end-of-speech (vad_end_time or audio_received_time) to audio sent to caller.
+        From real end-of-speech (speech_end_time or vad_end_time - endpointing_delay) to audio sent to caller.
         """
-        ref_start = self.vad_end_time if self.vad_end_time is not None else self.audio_received_time
+        ref_start = (
+            self.speech_end_time
+            if self.speech_end_time is not None
+            else self.vad_end_time
+            if self.vad_end_time is not None
+            else self.audio_received_time
+        )
         if self.audio_sent_time is not None and ref_start is not None:
             return max(0.0, (self.audio_sent_time - ref_start) * 1000.0)
         return None
+
+    @property
+    def total_from_speech_end_ms(self) -> Optional[float]:
+        """Alias for total latency from speech end."""
+        return self.ttfa_ms
 
     @property
     def total_turn_duration_ms(self) -> Optional[float]:
@@ -146,14 +192,19 @@ class LatencyTrace(BaseModel):
 
     def get_metrics_summary(self) -> Dict[str, Optional[float]]:
         return {
+            "speech_duration_ms": self.speech_duration_ms,
+            "endpointing_delay_ms": self.endpointing_delay_ms,
             "vad_latency_ms": self.vad_latency_ms,
             "stt_latency_ms": self.stt_latency_ms,
             "llm_ttft_ms": self.llm_ttft_ms,
+            "first_clause_ms": self.first_clause_ms,
             "llm_total_latency_ms": self.llm_total_latency_ms,
             "tts_ttfb_ms": self.tts_ttfb_ms,
             "tts_total_latency_ms": self.tts_total_latency_ms,
             "network_buffering_ms": self.network_buffering_ms,
+            "send_ms": self.send_ms,
             "ttfa_ms": self.ttfa_ms,
+            "total_from_speech_end_ms": self.total_from_speech_end_ms,
             "total_turn_duration_ms": self.total_turn_duration_ms,
         }
 
@@ -311,32 +362,57 @@ class VoiceTelemetryRecorder:
             self.latency.audio_received_time = time.perf_counter()
 
     def mark_vad_start(self) -> None:
-        self.latency.vad_start_time = time.perf_counter()
+        if self.latency.vad_start_time is None:
+            self.latency.vad_start_time = time.perf_counter()
 
-    def mark_vad_end(self) -> None:
-        self.latency.vad_end_time = time.perf_counter()
+    def mark_vad_end(
+        self,
+        speech_end_time: Optional[float] = None,
+        endpointing_delay_ms: Optional[float] = None,
+    ) -> None:
+        now = time.perf_counter()
+        self.latency.vad_end_time = now
+        if speech_end_time is not None:
+            self.latency.speech_end_time = speech_end_time
+        elif endpointing_delay_ms is not None:
+            self.latency.speech_end_time = now - (endpointing_delay_ms / 1000.0)
+        else:
+            self.latency.speech_end_time = now
+
+        if endpointing_delay_ms is not None:
+            self.latency.endpointing_delay_time_ms = endpointing_delay_ms
+        elif self.latency.speech_end_time is not None:
+            self.latency.endpointing_delay_time_ms = max(0.0, (now - self.latency.speech_end_time) * 1000.0)
 
     def mark_stt_start(self) -> None:
-        self.latency.stt_start_time = time.perf_counter()
+        if self.latency.stt_start_time is None:
+            self.latency.stt_start_time = time.perf_counter()
 
     def mark_stt_end(self) -> None:
         self.latency.stt_end_time = time.perf_counter()
 
     def mark_llm_start(self) -> None:
-        self.latency.llm_start_time = time.perf_counter()
+        if self.latency.llm_start_time is None:
+            self.latency.llm_start_time = time.perf_counter()
 
     def mark_llm_first_token(self) -> None:
         if self.latency.llm_first_token_time is None:
             self.latency.llm_first_token_time = time.perf_counter()
 
+    def mark_first_clause(self) -> None:
+        if self.latency.first_clause_time is None:
+            self.latency.first_clause_time = time.perf_counter()
+
     def mark_llm_end(self) -> None:
         self.latency.llm_end_time = time.perf_counter()
         if self.latency.llm_first_token_time is None:
-            # In non-streaming mode, first token timestamp matches generation completion
             self.latency.llm_first_token_time = self.latency.llm_end_time
+        if self.latency.first_clause_time is None:
+            self.latency.first_clause_time = self.latency.llm_first_token_time
 
     def mark_tts_start(self) -> None:
-        self.latency.tts_start_time = time.perf_counter()
+        if self.latency.tts_start_time is None:
+            self.latency.tts_start_time = time.perf_counter()
 
     def mark_tts_first_audio(self) -> None:
         if self.latency.tts_first_audio_time is None:
@@ -345,9 +421,44 @@ class VoiceTelemetryRecorder:
     def mark_tts_end(self) -> None:
         self.latency.tts_end_time = time.perf_counter()
 
+    def mark_send_start(self) -> None:
+        if self.latency.send_start_time is None:
+            self.latency.send_start_time = time.perf_counter()
+
     def mark_audio_sent(self) -> None:
         if self.latency.audio_sent_time is None:
             self.latency.audio_sent_time = time.perf_counter()
+
+    def mark_frontend_playback_start(self) -> None:
+        self.latency.frontend_playback_start_time = time.perf_counter()
+
+    def mark_frontend_playback_end(self) -> None:
+        self.latency.frontend_playback_end_time = time.perf_counter()
+
+    def mark_turn_completed(self) -> None:
+        self.latency.turn_completed_time = time.perf_counter()
+
+    def log_latency_summary(self) -> None:
+        m = self.latency.get_metrics_summary()
+        endpointing_ms = m.get("endpointing_delay_ms") or 0.0
+        stt_ms = m.get("stt_latency_ms") or 0.0
+        llm_first_token_ms = m.get("llm_ttft_ms") or 0.0
+        first_clause_ms = m.get("first_clause_ms") or 0.0
+        tts_first_byte_ms = m.get("tts_ttfb_ms") or 0.0
+        send_ms = m.get("send_ms") or 0.0
+        total_from_speech_end_ms = m.get("total_from_speech_end_ms") or 0.0
+        audio_len_s = self.audio_duration_sec or 0.0
+        logger.info(
+            "LATENCY endpointing_ms=%.1f, stt_ms=%.1f, llm_first_token_ms=%.1f, first_clause_ms=%.1f, tts_first_byte_ms=%.1f, send_ms=%.1f, total_from_speech_end_ms=%.1f, audio_len_s=%.2f",
+            endpointing_ms,
+            stt_ms,
+            llm_first_token_ms,
+            first_clause_ms,
+            tts_first_byte_ms,
+            send_ms,
+            total_from_speech_end_ms,
+            audio_len_s,
+        )
 
     def mark_frontend_playback_start(self) -> None:
         self.latency.frontend_playback_start_time = time.perf_counter()

@@ -11,11 +11,18 @@ import re
 import sys
 import tempfile
 import time
-from uuid import uuid4
+from collections import defaultdict
 from typing import AsyncGenerator
+from uuid import uuid4
 
+import httpx
 from fastapi import WebSocket
 from fastapi.websockets import WebSocketDisconnect
+
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - optional dependency
+    np = None
 
 from app.core.config import settings
 from app.core.websocket_manager import connection_manager
@@ -23,7 +30,18 @@ from app.crud.chat import chat_crud
 from app.crud.user import user_crud
 from app.db.session import async_session_maker
 from app.services.ai_service import get_ai_response, get_ai_response_stream
-from app.services.groq_service import GroqService, GroqServiceError
+from app.services.groq_service import GroqService, GroqServiceError, get_shared_client
+from app.services.receptionist_router import (
+    GREETING_RESPONSES,
+    TIMING_RESPONSES,
+    LOCATION_RESPONSES,
+    SERVICES_RESPONSES,
+    PRICING_RESPONSES,
+    APPOINTMENT_RESPONSES,
+    CLARIFICATION_RESPONSES,
+    FALLBACK_RESPONSES,
+    CLOSING_RESPONSES,
+)
 from app.services.telemetry import VoiceTelemetryRecorder
 from app.utils.audio_buffer import VADProcessor, TurnDetector, pcm_to_wav, mp3_to_pcm, wav_to_pcm
 from app.utils.prompts import voice_receptionist_prompt
@@ -49,6 +67,15 @@ _whisper_model = None
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 _vad_processor: VADProcessor | None = None
 
+# Pre-rendered and cached audio clips
+_web_tts_cache: dict[str, list[str]] = {}
+_vonage_pcm_cache: dict[str, bytes] = {}
+_call_language_cache: dict[str, str] = {}
+_prewarm_done: bool = False
+
+GREETING_TEXT = "Hello, thank you for calling Logic Pulse. This is Pulse Concierge AI. How can I assist you today?"
+FILLER_CLIPS = ["Ji,", "Ek second,", "Sure,"]
+
 
 async def _safe_send_json(websocket: WebSocket, payload: dict) -> None:
     try:
@@ -65,7 +92,7 @@ def _build_voice_identity(
     raw_identity = phone_number.strip() if phone_number and phone_number.strip() else anonymous_session_id
     raw_identity = raw_identity or str(uuid4())
     identity_digest = hashlib.sha256(raw_identity.encode("utf-8")).hexdigest()[:24]
-    return "Caller", f"voice-{identity_digest}@local.invalid"
+    return "Caller", f"voice-{identity_digest}@voice.logicpulse.com"
 
 
 async def get_or_create_user(phone_number: str | None, anonymous_session_id: str | None = None):
@@ -101,7 +128,12 @@ async def save_chat_message(user_id: int, user_message: str, bot_response: str) 
         logger.exception("Failed to save voice chat messages")
 
 
+_history_cache: dict[int, list[dict[str, str]]] = {}
+
+
 async def get_recent_voice_history(user_id: int) -> list[dict[str, str]]:
+    if user_id in _history_cache:
+        return _history_cache[user_id]
     try:
         async with async_session_maker() as db:
             recent_messages = await chat_crud.get_recent_messages(
@@ -109,10 +141,12 @@ async def get_recent_voice_history(user_id: int) -> list[dict[str, str]]:
                 user_id=user_id,
                 limit=settings.short_memory_messages,
             )
-            return [
+            history = [
                 {"role": message.role, "content": message.content}
                 for message in recent_messages
             ]
+            _history_cache[user_id] = history
+            return history
     except Exception:
         logger.exception("Failed to load voice history")
         return []
@@ -129,6 +163,7 @@ def load_models() -> None:
         _vad_processor = VADProcessor(
             aggressiveness=settings.vad_aggressiveness,
             sample_rate=16000,
+            min_rms=settings.vad_min_rms,
         )
 
         if WhisperModel is None:
@@ -165,9 +200,10 @@ def _get_whisper_model():
 
 
 def get_models_status() -> dict:
-    whisper = _get_whisper_model()
+    stt_provider_cfg = getattr(settings, "stt_provider", "groq_whisper")
+    groq_whisper_available = stt_provider_cfg == "groq_whisper" and bool(getattr(settings, "groq_api_key", None))
     return {
-        "whisper_loaded": whisper is not None,
+        "whisper_loaded": _whisper_model is not None or groq_whisper_available,
         "vad_loaded": _vad_processor is not None and _vad_processor.vad is not None,
         "tts_available": edge_tts is not None or pyttsx3 is not None,
     }
@@ -176,10 +212,10 @@ def get_models_status() -> dict:
 async def transcribe_audio_bytes(
     audio_bytes: bytes,
     telemetry_recorder: VoiceTelemetryRecorder | None = None,
+    call_id: str | None = None,
 ) -> str:
     if telemetry_recorder:
         telemetry_recorder.mark_stt_start()
-        # 16000 Hz, 1 channel, 16-bit (2 bytes per sample) = 32000 bytes/sec
         audio_dur = len(audio_bytes) / 32000.0 if audio_bytes else 0.0
         telemetry_recorder.record_stt_duration(audio_dur)
 
@@ -189,14 +225,20 @@ async def transcribe_audio_bytes(
             telemetry_recorder.mark_stt_end()
         return ""
 
-    wav_bytes = pcm_to_wav(audio_bytes, sample_rate=16000, channels=1, sampwidth=2)
+    cached_lang = _call_language_cache.get(call_id) if call_id else None
 
-    # Optional Groq Cloud Whisper path (when enabled & API key configured)
-    stt_provider_cfg = getattr(settings, "stt_provider", "faster_whisper")
+    # 1. Groq Cloud Whisper path (when enabled & API key configured)
+    stt_provider_cfg = getattr(settings, "stt_provider", "groq_whisper")
     if stt_provider_cfg == "groq_whisper" and getattr(settings, "groq_api_key", None):
         try:
+            wav_bytes = pcm_to_wav(audio_bytes, sample_rate=16000, channels=1, sampwidth=2)
             groq_svc = GroqService()
-            result, detected_lang, dur = await groq_svc.transcribe_audio_with_usage(wav_bytes)
+            result, detected_lang, dur = await groq_svc.transcribe_audio_with_usage(
+                wav_bytes, language=cached_lang
+            )
+            if call_id and detected_lang and detected_lang != "unknown":
+                _call_language_cache[call_id] = detected_lang
+
             logger.info("Groq transcribed %d bytes | length=%d | lang=%s", len(audio_bytes), len(result), detected_lang)
             if telemetry_recorder:
                 telemetry_recorder.record_stt_result(
@@ -211,32 +253,47 @@ async def transcribe_audio_bytes(
         except Exception:
             logger.exception("Groq STT failed; falling back to local Faster-Whisper.")
 
-    whisper = _get_whisper_model()
+    # 2. Local Faster-Whisper path (direct float32 numpy array, zero disk I/O)
+    whisper = _whisper_model
+    if whisper is None:
+        whisper = _get_whisper_model()
+
     if whisper is None:
         logger.warning("Local faster-whisper model unavailable; voice transcription disabled.")
         if telemetry_recorder:
             telemetry_recorder.mark_stt_end()
         return ""
 
-    temp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            temp_path = tmp.name
-            tmp.write(wav_bytes)
-
         def _transcribe() -> tuple[str, str | None, float | None]:
-            segments, info = whisper.transcribe(  # type: ignore[union-attr]
-                temp_path,
-                beam_size=1,
-                temperature=0.0,
-                compression_ratio_threshold=2.4,
-                no_speech_threshold=0.6,
-                log_prob_threshold=-1.0,
-                condition_on_previous_text=False,
-                vad_filter=True,
-                language=None,
-                initial_prompt="Logic Pulse AI Receptionist: Appointments, timings, services in English and Urdu.",
-            )
+            if np is not None:
+                audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                segments, info = whisper.transcribe(
+                    audio_array,
+                    beam_size=1,
+                    temperature=0.0,
+                    vad_filter=False,
+                    language=cached_lang,
+                    initial_prompt="Logic Pulse AI Receptionist: Appointments, timings, services in English and Urdu.",
+                )
+            else:
+                wav_bytes = pcm_to_wav(audio_bytes, sample_rate=16000, channels=1, sampwidth=2)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                    tmp.write(wav_bytes)
+                    tmp_name = tmp.name
+                try:
+                    segments, info = whisper.transcribe(
+                        tmp_name,
+                        beam_size=1,
+                        temperature=0.0,
+                        vad_filter=False,
+                        language=cached_lang,
+                        initial_prompt="Logic Pulse AI Receptionist: Appointments, timings, services in English and Urdu.",
+                    )
+                finally:
+                    if os.path.exists(tmp_name):
+                        os.unlink(tmp_name)
+
             text = " ".join(
                 segment.text.strip() for segment in segments if segment.text.strip()
             ).strip()
@@ -245,6 +302,9 @@ async def transcribe_audio_bytes(
             return text, lang, lang_prob
 
         result, detected_lang, lang_prob = await asyncio.to_thread(_transcribe)
+        if call_id and detected_lang:
+            _call_language_cache[call_id] = detected_lang
+
         logger.info("Transcribed %d bytes | length=%d | lang=%s | prob=%s", len(audio_bytes), len(result), detected_lang, lang_prob)
         if telemetry_recorder:
             telemetry_recorder.record_stt_result(
@@ -261,12 +321,6 @@ async def transcribe_audio_bytes(
         if telemetry_recorder:
             telemetry_recorder.mark_stt_end()
         return ""
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.unlink(temp_path)
-            except Exception:
-                logger.debug("Failed to delete temporary audio file", exc_info=True)
 
 
 def _pyttsx3_to_wav_bytes(text: str) -> bytes:
@@ -315,7 +369,7 @@ def _select_tts_voice(text: str) -> str:
         "scheduled", "confirmed", "receive", "details", "sms", "services", "system"
     }
 
-    # Roman Urdu grammatical particles and pronouns (excluding proper nouns like Muhammad, Ramzan, Logic Pulse)
+    # Roman Urdu grammatical particles and pronouns
     roman_urdu_markers = {
         "aap", "aapki", "aapka", "hamari", "humari", "hain", "hai", "kya", "madad",
         "shukriya", "khushamdeed", "rabta", "salam", "assalam", "karen", "karte",
@@ -372,28 +426,104 @@ async def generate_tts_chunks(
             telemetry_recorder.mark_tts_end()
 
 
+async def synthesize_full_tts(text: str) -> bytes:
+    chunks = []
+    async for chunk in generate_tts_chunks(text):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def prewarm_canned_text(text: str) -> None:
+    if not text or text in _web_tts_cache:
+        return
+    try:
+        audio = await synthesize_full_tts(text)
+        if audio:
+            b64_val = base64.b64encode(audio).decode("utf-8")
+            _web_tts_cache[text] = [b64_val]
+            pcm = await asyncio.to_thread(mp3_to_pcm, audio, 16000)
+            if pcm:
+                _vonage_pcm_cache[text] = pcm
+    except Exception as exc:
+        logger.debug("Failed prewarming TTS for %s: %s", text[:20], exc)
+
+
+async def groq_keepalive_worker() -> None:
+    """Keeps connection alive to Groq API to eliminate TLS handshake overhead."""
+    while True:
+        try:
+            await asyncio.sleep(45.0)
+            if settings.groq_api_key:
+                client = get_shared_client()
+                url = f"{settings.groq_base_url.rstrip('/')}/models"
+                await client.get(url, headers={"Authorization": f"Bearer {settings.groq_api_key}"}, timeout=5.0)
+        except Exception:
+            pass
+
+
+async def prewarm_voice_cache() -> None:
+    global _prewarm_done
+    if _prewarm_done or "pytest" in sys.modules or os.getenv("TESTING", "").lower() in ("true", "1"):
+        return
+    _prewarm_done = True
+    logger.info("Prewarming Voice Cache and AI engines...")
+
+    all_texts = [
+        GREETING_TEXT,
+        *GREETING_RESPONSES,
+        *TIMING_RESPONSES,
+        *LOCATION_RESPONSES,
+        *SERVICES_RESPONSES,
+        *PRICING_RESPONSES,
+        *APPOINTMENT_RESPONSES,
+        *CLARIFICATION_RESPONSES,
+        *FALLBACK_RESPONSES,
+        *CLOSING_RESPONSES,
+        *FILLER_CLIPS,
+        "ہمارے دفتری اوقات پیر سے جمعہ صبح 9 بجے سے شام 5 بجے تک ہیں۔",
+        "ہم کسٹم سافٹ ویئر ڈویلپمنٹ، AI اور آٹومیشن سسٹمز، چیٹ بوٹس، بزنس ڈیش بورڈز اور ویب و موبائل ایپلیکیشنز فراہم کرتے ہیں۔",
+        "Goodbye! Have a nice day.",
+    ]
+
+    # Prewarm Edge-TTS in parallel tasks
+    tts_tasks = [prewarm_canned_text(txt) for txt in all_texts]
+    await asyncio.gather(*tts_tasks, return_exceptions=True)
+    logger.info("Prewarmed %d TTS response entries into in-memory cache.", len(_web_tts_cache))
+
+    # Prewarm Groq LLM
+    if settings.groq_api_key:
+        try:
+            groq_svc = GroqService()
+            await groq_svc.chat_completion([{"role": "user", "content": "ping"}])
+            logger.info("Groq LLM connection prewarmed successfully.")
+        except Exception as exc:
+            logger.debug("Groq prewarm ping failed: %s", exc)
+
+    # Start Groq background keepalive task (runs every 45s)
+    asyncio.create_task(groq_keepalive_worker())
+
 
 async def process_voice_websocket(websocket: WebSocket, phone_number: str | None) -> None:
     call_id = str(uuid4())
     user = await get_or_create_user(phone_number, anonymous_session_id=call_id)
+    # Load history ONCE at call start into memory to eliminate DB reads on the critical path
+    session_history = await get_recent_voice_history(user.id)
+
     turn_detector = TurnDetector()
-    audio_accumulator = bytearray()
-    loop = asyncio.get_running_loop()
     current_generation_task: asyncio.Task | None = None
     assistant_is_speaking = False
     active_recorder: VoiceTelemetryRecorder | None = None
-
-    async def _build_history() -> list[dict[str, str]]:
-        return await get_recent_voice_history(user.id)
+    client_listening_sent = False
 
     async def _run_generation_flow(pcm_to_process: bytes, recorder: VoiceTelemetryRecorder):
         nonlocal assistant_is_speaking
         try:
-            transcript = await transcribe_audio_bytes(pcm_to_process, telemetry_recorder=recorder)
+            transcript = await transcribe_audio_bytes(pcm_to_process, telemetry_recorder=recorder, call_id=call_id)
             if not transcript.strip():
                 logger.info("Empty transcript from %d bytes audio.", len(pcm_to_process))
                 await _safe_send_json(websocket, {"type": "no_speech", "data": "No clear speech detected. Please speak again."})
                 recorder.finalize()
+                recorder.log_latency_summary()
                 return
 
             assistant_is_speaking = True
@@ -404,54 +534,128 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                 await _safe_send_json(websocket, {"type": "goodbye", "data": "Goodbye!"})
                 assistant_is_speaking = False
                 recorder.finalize()
+                recorder.log_latency_summary()
                 raise WebSocketDisconnect()
 
             system_prompt = voice_receptionist_prompt()
             await _safe_send_json(websocket, {"type": "response_start", "data": ""})
 
-            chunk_index = 0
-            full_response_parts = []
+            # Pipelined LLM and TTS Producer/Consumer
+            tts_queue: asyncio.Queue[tuple[int, str, bytes] | None] = asyncio.Queue()
             first_audio_sent = False
+            cancel_filler = asyncio.Event()
 
-            async for sentence in get_ai_response_stream(
-                user_name=getattr(user, "name", None) or (phone_number or "guest"),
-                user_email=getattr(user, "email", None) or f"{getattr(user, 'name', None) or 'guest'}@example.com",
-                message=transcript,
-                history=await _build_history(),
-                system_prompt=system_prompt,
-                telemetry_recorder=recorder,
-            ):
-                if not sentence.strip():
-                    continue
-                full_response_parts.append(sentence)
+            # 700ms filler task: if LLM-bound turn has no audio within 700ms, play one filler
+            async def _filler_timer():
+                try:
+                    await asyncio.sleep(0.700)
+                    if not cancel_filler.is_set() and not first_audio_sent:
+                        filler_clip = _web_tts_cache.get("Ji,") or _web_tts_cache.get("Sure,")
+                        if filler_clip:
+                            recorder.mark_send_start()
+                            await _safe_send_json(
+                                websocket,
+                                {
+                                    "type": "audio_chunk",
+                                    "data": filler_clip[0],
+                                    "index": -1,
+                                    "is_filler": True,
+                                }
+                            )
+                            recorder.mark_audio_sent()
+                except asyncio.CancelledError:
+                    pass
 
-                # Stream TTS audio for this sentence immediately
-                sentence_audio_parts = []
-                async for audio_chunk in generate_tts_chunks(sentence, telemetry_recorder=recorder):
-                    if not first_audio_sent:
-                        recorder.mark_audio_sent()
-                        first_audio_sent = True
-                    sentence_audio_parts.append(audio_chunk)
+            filler_task = asyncio.create_task(_filler_timer())
 
-                if sentence_audio_parts:
-                    complete_sentence_audio = b"".join(sentence_audio_parts)
-                    encoded = base64.b64encode(complete_sentence_audio).decode()
+            producer_error: Exception | None = None
+            full_response_parts: list[str] = []
+
+            async def _llm_tts_producer():
+                nonlocal producer_error
+                try:
+                    chunk_index = 0
+                    async for sentence in get_ai_response_stream(
+                        user_name=getattr(user, "name", None) or (phone_number or "guest"),
+                        user_email=getattr(user, "email", None) or f"{getattr(user, 'name', None) or 'guest'}@example.com",
+                        message=transcript,
+                        history=session_history,
+                        system_prompt=system_prompt,
+                        telemetry_recorder=recorder,
+                        user_id=getattr(user, "id", None),
+                    ):
+                        if not sentence.strip():
+                            continue
+                        full_response_parts.append(sentence)
+
+                        # Check if sentence is pre-rendered in cache
+                        cached = _web_tts_cache.get(sentence)
+                        if cached:
+                            for part in cached:
+                                await tts_queue.put((chunk_index, sentence, base64.b64decode(part)))
+                                chunk_index += 1
+                            continue
+
+                        # Synthesize TTS for this sentence
+                        sentence_audio_parts = []
+                        async for audio_chunk in generate_tts_chunks(sentence, telemetry_recorder=recorder):
+                            sentence_audio_parts.append(audio_chunk)
+
+                        if sentence_audio_parts:
+                            complete_sentence_audio = b"".join(sentence_audio_parts)
+                            await tts_queue.put((chunk_index, sentence, complete_sentence_audio))
+                            chunk_index += 1
+
+                    await tts_queue.put(None)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    producer_error = exc
+                    await tts_queue.put(None)
+
+            producer_task = asyncio.create_task(_llm_tts_producer())
+
+            try:
+                while True:
+                    item = await tts_queue.get()
+                    if item is None:
+                        break
+
+                    chunk_idx, sent_text, audio_bytes = item
+                    encoded = base64.b64encode(audio_bytes).decode("utf-8")
+                    recorder.mark_send_start()
                     await _safe_send_json(
                         websocket,
                         {
                             "type": "audio_chunk",
                             "data": encoded,
-                            "index": chunk_index,
+                            "index": chunk_idx,
                         },
                     )
-                    chunk_index += 1
+                    if not first_audio_sent:
+                        cancel_filler.set()
+                        if not filler_task.done():
+                            filler_task.cancel()
+                        recorder.mark_audio_sent()
+                        first_audio_sent = True
+
+                await producer_task
+                if producer_error:
+                    raise producer_error
+
+            finally:
+                cancel_filler.set()
+                if not filler_task.done():
+                    filler_task.cancel()
+                if not producer_task.done():
+                    producer_task.cancel()
 
             full_response = " ".join(full_response_parts).strip()
             cost_obj = getattr(recorder, "cost", None)
             provider_val = getattr(cost_obj, "provider", "")
-            is_local = (provider_val == "local_router")
-            source_type = "local_rule" if is_local else "ai_llm"
-            provider_name = "Local Rule Engine ($0 Cost)" if is_local else f"Groq AI ({getattr(cost_obj, 'model', settings.groq_model)})"
+            is_local = (provider_val in ("local_router", "tool_service"))
+            source_type = "tool_service" if provider_val == "tool_service" else ("local_rule" if is_local else "ai_llm")
+            provider_name = "Deterministic Appointment Tool" if provider_val == "tool_service" else ("Local Rule Engine ($0 Cost)" if is_local else f"Groq AI ({getattr(cost_obj, 'model', settings.groq_model)})")
             await _safe_send_json(
                 websocket,
                 {
@@ -463,12 +667,17 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
             )
             assistant_is_speaking = False
             recorder.finalize()
+            recorder.log_latency_summary()
 
             if full_response:
-                await save_chat_message(
-                    user_id=user.id,
-                    user_message=transcript,
-                    bot_response=full_response,
+                session_history.append({"role": "user", "content": transcript})
+                session_history.append({"role": "assistant", "content": full_response})
+                asyncio.create_task(
+                    save_chat_message(
+                        user_id=user.id,
+                        user_message=transcript,
+                        bot_response=full_response,
+                    )
                 )
         except asyncio.CancelledError:
             logger.info("Generation flow cancelled due to interruption.")
@@ -506,6 +715,11 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                     logger.warning("Rejected oversized or malformed voice packet")
                     await _safe_send_json(websocket, {"type": "error", "data": "Audio packet rejected"})
                     continue
+
+                if not client_listening_sent:
+                    await _safe_send_json(websocket, {"type": "listening", "data": ""})
+                    client_listening_sent = True
+
                 turn_result = turn_detector.process_frame(data)
 
                 if turn_result.turn_started:
@@ -521,26 +735,18 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                         active_recorder.mark_audio_received()
                         active_recorder.mark_vad_start()
 
-                audio_accumulator.extend(data)
-                if len(audio_accumulator) > settings.voice_max_buffer_bytes:
-                    logger.warning("Voice buffer limit reached; resetting partial turn")
-                    audio_accumulator.clear()
-                    turn_detector.reset()
-                    active_recorder = None
-                    await _safe_send_json(websocket, {"type": "error", "data": "Audio turn exceeded size limit"})
-                    continue
-                await _safe_send_json(websocket, {"type": "listening", "data": ""})
-
                 # Check if natural turn completion occurred
                 if turn_result.turn_completed and turn_result.audio_bytes:
+                    client_listening_sent = False
                     pcm_to_process = turn_result.audio_bytes
-                    audio_accumulator.clear()
 
                     if active_recorder is None:
                         active_recorder = VoiceTelemetryRecorder(call_id=call_id, channel="voice_ws")
                         active_recorder.mark_audio_received()
                         active_recorder.mark_vad_start()
-                    active_recorder.mark_vad_end()
+                    active_recorder.mark_vad_end(
+                        endpointing_delay_ms=turn_result.endpointing_delay_ms
+                    )
 
                     turn_recorder = active_recorder
                     active_recorder = None
@@ -549,7 +755,9 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                         current_generation_task.cancel()
                         assistant_is_speaking = False
 
-                    current_generation_task = asyncio.create_task(_run_generation_flow(pcm_to_process, turn_recorder))
+                    current_generation_task = asyncio.create_task(
+                        _run_generation_flow(pcm_to_process, turn_recorder)
+                    )
 
             elif "text" in msg:
                 try:
@@ -567,6 +775,7 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                         assistant_is_speaking = False
                         logger.info("Cancelled ongoing LLM/TTS generation task.")
                     active_recorder = None
+                    client_listening_sent = False
                     await _safe_send_json(websocket, {"type": "voice_interrupted"})
 
                 elif event_type == "goodbye":
@@ -576,22 +785,10 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
 
                 elif event_type == "speech_ended":
                     logger.info("Speech ended received from client.")
-                    
-                    # If a generation task is already actively running for this turn, do not cancel it
-                    # unless we have a large new buffer of speech that was not included.
-                    if current_generation_task and not current_generation_task.done():
-                        if len(audio_accumulator) < 9600:
-                            logger.info("Generation task already processing speech. Keeping active task.")
-                            audio_accumulator.clear()
-                            turn_detector.reset()
-                            continue
-
-                    pcm_to_process = bytes(audio_accumulator) if audio_accumulator else (turn_detector._active_utterance or b"")
-                    audio_accumulator.clear()
+                    # Use TurnDetector's bounded utterance only (or fallback to pre_buffer if empty)
+                    pcm_to_process = bytes(turn_detector._active_utterance) if turn_detector._active_utterance else (b"".join(turn_detector._pre_buffer) or b"\x00\x00" * 320)
                     turn_detector.reset()
-                    if not pcm_to_process:
-                        logger.info("Speech ended received with empty audio buffer.")
-                        continue
+                    client_listening_sent = False
 
                     if active_recorder is None:
                         active_recorder = VoiceTelemetryRecorder(call_id=call_id, channel="voice_ws")
@@ -606,8 +803,9 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                         current_generation_task.cancel()
                         assistant_is_speaking = False
 
-                    current_generation_task = asyncio.create_task(_run_generation_flow(pcm_to_process, turn_recorder))
-
+                    current_generation_task = asyncio.create_task(
+                        _run_generation_flow(pcm_to_process, turn_recorder)
+                    )
 
     finally:
         if current_generation_task and not current_generation_task.done():
@@ -615,24 +813,21 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
             assistant_is_speaking = False
 
 
-from collections import defaultdict
-import httpx
-
 _sms_history = defaultdict(list)
+
 
 def check_sms_rate_limit(phone_number: str) -> bool:
     now = time.time()
     window = settings.sms_rate_limit_window_seconds
     limit = settings.sms_rate_limit_count
     
-    # Clean up old timestamps
     _sms_history[phone_number] = [t for t in _sms_history[phone_number] if now - t < window]
-    
     if len(_sms_history[phone_number]) >= limit:
         return False
         
     _sms_history[phone_number].append(now)
     return True
+
 
 async def send_vonage_sms(to_phone: str, body: str) -> str:
     """
@@ -647,7 +842,6 @@ async def send_vonage_sms(to_phone: str, body: str) -> str:
         logger.warning("SMS rate limit exceeded")
         return "rate_limited"
 
-    # Keep SMS concise (max 2-3 messages = max 450 chars)
     max_chars = 450
     if len(body) > max_chars:
         body = body[:max_chars - 3] + "..."
@@ -661,23 +855,21 @@ async def send_vonage_sms(to_phone: str, body: str) -> str:
             "to": to_phone,
             "text": body
         }
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, data=data)
-            resp.raise_for_status()
-            resp_data = resp.json()
-            
-            messages = resp_data.get("messages", [])
-            if messages and messages[0].get("status") == "0":
-                logger.info("Vonage SMS sent successfully")
-                return "sent"
-            else:
-                status_code = messages[0].get("status") if messages else "unknown"
-                error_text = messages[0].get("error-text") if messages else "No response messages"
-                logger.error("Vonage SMS failed with provider status %s", status_code)
-                return "failed"
+        client = get_shared_client()
+        resp = await client.post(url, data=data)
+        resp.raise_for_status()
+        resp_data = resp.json()
+        
+        messages = resp_data.get("messages", [])
+        if messages and messages[0].get("status") == "0":
+            logger.info("Vonage SMS sent successfully")
+            return "sent"
+        else:
+            status_code = messages[0].get("status") if messages else "unknown"
+            logger.error("Vonage SMS failed with provider status %s", status_code)
+            return "failed"
     except Exception:
         logger.exception("Failed to send Vonage SMS")
-        # System should never crash due to external SMS failure
         return "failed"
 
 
@@ -689,11 +881,34 @@ async def play_audio_stream(
 ):
     """
     Streams audio responses to Vonage by converting generated TTS chunks to 16kHz PCM
-    and sending them as 20ms binary frames. Stops immediately if cancel_event is set.
-    Supports either a static text string or an incremental sentence-level stream.
+    and sending them as 20ms binary frames with deadline clock pacing.
     """
     try:
         is_first_frame = True
+        loop = asyncio.get_running_loop()
+
+        # 1. If text is pre-rendered in cache, stream immediately
+        if isinstance(text_or_stream, str) and text_or_stream in _vonage_pcm_cache:
+            pcm_bytes = _vonage_pcm_cache[text_or_stream]
+            chunk_size = 640
+            next_t = loop.time()
+            for i in range(0, len(pcm_bytes), chunk_size):
+                if cancel_event.is_set():
+                    break
+                packet = pcm_bytes[i : i + chunk_size]
+                if len(packet) < chunk_size:
+                    packet = packet + b"\x00" * (chunk_size - len(packet))
+
+                await connection_manager.send_bytes(connection_id, packet)
+                if is_first_frame and telemetry_recorder:
+                    telemetry_recorder.mark_audio_sent()
+                    is_first_frame = False
+
+                next_t += 0.02
+                sleep_dur = next_t - loop.time()
+                if sleep_dur > 0:
+                    await asyncio.sleep(sleep_dur)
+            return
 
         async def _sentence_iter():
             if isinstance(text_or_stream, str):
@@ -702,28 +917,54 @@ async def play_audio_stream(
                 async for item in text_or_stream:
                     yield item
 
-        async for sentence in _sentence_iter():
-            if cancel_event.is_set():
-                break
-            if not sentence.strip():
-                continue
+        # Sentence-level producer/consumer for audio synthesis and playback
+        pcm_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=10)
 
-            async for audio_chunk in generate_tts_chunks(sentence, telemetry_recorder=telemetry_recorder):
-                if cancel_event.is_set():
-                    break
-
-                # Convert generated TTS bytes (WAV/MP3) to raw PCM (16kHz, 16-bit mono)
-                pcm_bytes = mp3_to_pcm(audio_chunk, target_rate=16000)
-                if not pcm_bytes:
-                    continue
-
-                # Send raw PCM in 20ms chunks (640 bytes = 20ms of 16kHz 16-bit mono PCM)
-                chunk_size = 640
-                delay = 0.02
-                for i in range(0, len(pcm_bytes), chunk_size):
+        async def _synth_producer():
+            try:
+                async for sentence in _sentence_iter():
                     if cancel_event.is_set():
                         break
-                    packet = pcm_bytes[i : i + chunk_size]
+                    if not sentence.strip():
+                        continue
+
+                    # Check cached sentence PCM
+                    if sentence in _vonage_pcm_cache:
+                        await pcm_queue.put(_vonage_pcm_cache[sentence])
+                        continue
+
+                    sentence_parts = []
+                    async for audio_chunk in generate_tts_chunks(sentence, telemetry_recorder=telemetry_recorder):
+                        if cancel_event.is_set():
+                            break
+                        sentence_parts.append(audio_chunk)
+
+                    if sentence_parts:
+                        full_audio = b"".join(sentence_parts)
+                        # Decode mp3 to pcm in worker thread
+                        pcm_bytes = await asyncio.to_thread(mp3_to_pcm, full_audio, 16000)
+                        if pcm_bytes:
+                            await pcm_queue.put(pcm_bytes)
+
+                await pcm_queue.put(None)
+            except Exception as exc:
+                logger.debug("Vonage synth producer exception: %s", exc)
+                await pcm_queue.put(None)
+
+        synth_task = asyncio.create_task(_synth_producer())
+
+        try:
+            next_t = loop.time()
+            chunk_size = 640
+            while True:
+                pcm_sentence = await pcm_queue.get()
+                if pcm_sentence is None or cancel_event.is_set():
+                    break
+
+                for i in range(0, len(pcm_sentence), chunk_size):
+                    if cancel_event.is_set():
+                        break
+                    packet = pcm_sentence[i : i + chunk_size]
                     if len(packet) < chunk_size:
                         packet = packet + b"\x00" * (chunk_size - len(packet))
 
@@ -731,9 +972,19 @@ async def play_audio_stream(
                     if is_first_frame and telemetry_recorder:
                         telemetry_recorder.mark_audio_sent()
                         is_first_frame = False
-                    await asyncio.sleep(delay)
+
+                    next_t += 0.02
+                    sleep_dur = next_t - loop.time()
+                    if sleep_dur > 0:
+                        await asyncio.sleep(sleep_dur)
+
+            await synth_task
+        finally:
+            if not synth_task.done():
+                synth_task.cancel()
+
     except asyncio.CancelledError:
-        logger.info("Playback stream task cancelled.")
+        logger.info("Vonage playback stream task cancelled.")
     except Exception:
         logger.exception("Error in play_audio_stream")
     finally:
@@ -748,13 +999,12 @@ async def process_vonage_websocket(websocket: WebSocket) -> None:
     connection_id = None
     phone_number = None
     try:
-        # Wait for the initial text message containing metadata from Vonage
         data = await asyncio.wait_for(websocket.receive(), timeout=10.0)
         if "text" in data:
             meta = json.loads(data["text"])
             connection_id = meta.get("uuid") or meta.get("conversation_uuid")
             phone_number = meta.get("from")
-            logger.info("Vonage WebSocket connected")
+            logger.info("Vonage WebSocket connected: %s", connection_id)
     except Exception as exc:
         logger.warning("Failed to parse initial Vonage metadata. Auto-generating session ID.", exc_info=exc)
 
@@ -763,75 +1013,130 @@ async def process_vonage_websocket(websocket: WebSocket) -> None:
 
     await connection_manager.connect(connection_id, websocket)
 
-    user = await get_or_create_user(phone_number, anonymous_session_id=connection_id)
-    turn_detector = TurnDetector()
-    loop = asyncio.get_running_loop()
-    last_activity_time = loop.time()
-    active_recorder: VoiceTelemetryRecorder | None = None
-    silence_timeout = float(settings.silence_timeout_sec)
-
-    playback_task = None
     cancel_event = asyncio.Event()
+    playback_task: asyncio.Task | None = None
+    current_generation_task: asyncio.Task | None = None
+    loop = asyncio.get_running_loop()
 
-    async def _build_history() -> list[dict[str, str]]:
-        return await get_recent_voice_history(user.id)
-
-    async def play_reply(text: str | AsyncGenerator[str, None], recorder: VoiceTelemetryRecorder | None = None):
+    async def play_vonage_audio(text_or_stream: str | AsyncGenerator[str, None], recorder: VoiceTelemetryRecorder | None = None):
         nonlocal playback_task, cancel_event
-        # 1. Cancel previous playback if running
         if playback_task and not playback_task.done():
             cancel_event.set()
             playback_task.cancel()
             await connection_manager.send_json(connection_id, {"action": "clear"})
-            logger.info("Barge-in: playback interrupted.")
+            logger.info("Barge-in: Vonage playback interrupted.")
 
-        # 2. Reset cancellation event
         cancel_event = asyncio.Event()
-        # 3. Stream the new response
         playback_task = asyncio.create_task(
-            play_audio_stream(connection_id, text, cancel_event, telemetry_recorder=recorder)
+            play_audio_stream(connection_id, text_or_stream, cancel_event, telemetry_recorder=recorder)
         )
 
-    # Trigger welcome greeting on connect
-    GREETING_TEXT = "Hello, thank you for calling Logic Pulse. This is Pulse Concierge AI. How can I assist you today?"
-    await play_reply(GREETING_TEXT)
+    # 1. Play greeting IMMEDIATELY from pre-rendered cache
+    await play_vonage_audio(GREETING_TEXT)
+
+    # 2. Parallel user retrieval and history initialization
+    user_task = asyncio.create_task(get_or_create_user(phone_number, anonymous_session_id=connection_id))
+    user = await user_task
+    session_history = await get_recent_voice_history(user.id)
+
+    turn_detector = TurnDetector()
+    last_activity_time = loop.time()
+    active_recorder: VoiceTelemetryRecorder | None = None
+    silence_timeout = float(settings.silence_timeout_sec)
+
+    async def _run_vonage_turn(pcm_data: bytes, recorder: VoiceTelemetryRecorder):
+        try:
+            transcript = await transcribe_audio_bytes(pcm_data, telemetry_recorder=recorder, call_id=connection_id)
+            if not transcript.strip():
+                recorder.finalize()
+                recorder.log_latency_summary()
+                return
+
+            transcript_lower = transcript.lower()
+            if any(word in transcript_lower for word in ["goodbye", "bye", "exit"]):
+                farewell = "Goodbye! Have a nice day."
+                await play_vonage_audio(farewell, recorder)
+                recorder.finalize()
+                recorder.log_latency_summary()
+                await asyncio.sleep(2.0)
+                return
+
+            system_prompt = voice_receptionist_prompt()
+            response_stream = get_ai_response_stream(
+                user_name=getattr(user, "name", None) or (phone_number or "guest"),
+                user_email=getattr(user, "email", None) or f"{getattr(user, 'name', None) or 'guest'}@example.com",
+                message=transcript,
+                history=session_history,
+                system_prompt=system_prompt,
+                telemetry_recorder=recorder,
+                user_id=getattr(user, "id", None),
+            )
+
+            full_sentences = []
+            async def _collect_stream():
+                async for sentence in response_stream:
+                    if sentence.strip():
+                        full_sentences.append(sentence)
+                        yield sentence
+
+            await play_vonage_audio(_collect_stream(), recorder)
+
+            # Wait for playback to finish and save history
+            if playback_task:
+                await playback_task
+            full_bot_text = " ".join(full_sentences).strip()
+            if full_bot_text:
+                session_history.append({"role": "user", "content": transcript})
+                session_history.append({"role": "assistant", "content": full_bot_text})
+                asyncio.create_task(
+                    save_chat_message(
+                        user_id=user.id,
+                        user_message=transcript,
+                        bot_response=full_bot_text,
+                    )
+                )
+            recorder.log_latency_summary()
+        except asyncio.CancelledError:
+            logger.info("Vonage turn cancelled due to barge-in.")
+        except Exception as exc:
+            logger.exception("Error in Vonage turn processing: %s", exc)
 
     try:
         while True:
             try:
                 msg = await asyncio.wait_for(websocket.receive(), timeout=35.0)
             except asyncio.TimeoutError:
-                logger.info(f"Session timeout for connection: {connection_id}")
+                logger.info("Session timeout for Vonage connection: %s", connection_id)
                 break
 
             if "bytes" in msg:
                 data = msg["bytes"]
                 if not isinstance(data, bytes) or len(data) > settings.voice_max_packet_bytes:
-                    logger.warning("Rejected oversized or malformed Vonage audio packet")
                     continue
             elif "text" in msg:
-                # Skip event status updates
                 continue
             else:
                 break
 
             turn_result = turn_detector.process_frame(data)
             current_time = loop.time()
-            turn_recorder: VoiceTelemetryRecorder | None = None
 
             if turn_result.turn_started:
                 last_activity_time = current_time
-                # Barge-in: If caller starts speaking during assistant playback, cancel immediately
+                # Barge-in: If caller starts speaking, cancel playback and any running turn immediately
                 if playback_task and not playback_task.done():
                     cancel_event.set()
                     playback_task.cancel()
                     await connection_manager.send_json(connection_id, {"action": "clear"})
-                    logger.info("Barge-in: Interrupted current playing audio stream on Vonage.")
+                    logger.info("Barge-in: Cancelled playback on Vonage.")
+                if current_generation_task and not current_generation_task.done():
+                    current_generation_task.cancel()
 
                 if active_recorder is None:
                     active_recorder = VoiceTelemetryRecorder(call_id=connection_id, channel="vonage_voice")
                     active_recorder.mark_audio_received()
                     active_recorder.mark_vad_start()
+
             elif turn_result.is_speech:
                 last_activity_time = current_time
 
@@ -841,74 +1146,29 @@ async def process_vonage_websocket(websocket: WebSocket) -> None:
                     active_recorder = VoiceTelemetryRecorder(call_id=connection_id, channel="vonage_voice")
                     active_recorder.mark_audio_received()
                     active_recorder.mark_vad_start()
-                active_recorder.mark_vad_end()
+                active_recorder.mark_vad_end(
+                    endpointing_delay_ms=turn_result.endpointing_delay_ms
+                )
                 turn_recorder = active_recorder
                 active_recorder = None
 
-                transcript = await transcribe_audio_bytes(turn_result.audio_bytes, telemetry_recorder=turn_recorder)
+                if current_generation_task and not current_generation_task.done():
+                    current_generation_task.cancel()
+
+                current_generation_task = asyncio.create_task(_run_vonage_turn(turn_result.audio_bytes, turn_recorder))
+
             elif current_time - last_activity_time > silence_timeout:
-                logger.info("Silence timeout exceeded")
+                logger.info("Silence timeout exceeded on Vonage connection %s", connection_id)
                 break
-            else:
-                continue
-
-            if not transcript.strip():
-                if turn_recorder:
-                    turn_recorder.finalize()
-                continue
-
-            logger.info("Voice transcript received | length=%d", len(transcript))
-
-            # Check for goodbye exit phrases
-            transcript_lower = transcript.lower()
-            if any(word in transcript_lower for word in ["goodbye", "bye", "exit"]):
-                farewell = "Goodbye! Have a nice day."
-                await play_reply(farewell, turn_recorder)
-                await asyncio.sleep(2.0)
-                break
-
-            system_prompt = voice_receptionist_prompt()
-            response_stream = get_ai_response_stream(
-                user_name=getattr(user, "name", None) or (phone_number or "guest"),
-                user_email=getattr(user, "email", None) or f"{getattr(user, 'name', None) or 'guest'}@example.com",
-                message=transcript,
-                history=await _build_history(),
-                system_prompt=system_prompt,
-                telemetry_recorder=turn_recorder,
-            )
-
-            full_sentences = []
-            async def _stream_and_collect():
-                async for s in response_stream:
-                    full_sentences.append(s)
-                    yield s
-
-            await play_reply(_stream_and_collect(), turn_recorder)
-
-            # Save chat history once playback completes
-            async def _save_after_playback():
-                if playback_task:
-                    try:
-                        await playback_task
-                    except (asyncio.CancelledError, Exception) as exc:
-                        logger.debug("Playback task finished or cancelled: %s", exc)
-                full_bot_text = " ".join(full_sentences).strip()
-                if full_bot_text:
-                    await save_chat_message(
-                        user_id=user.id,
-                        user_message=transcript,
-                        bot_response=full_bot_text,
-                    )
-
-            asyncio.create_task(_save_after_playback())
-
 
     except WebSocketDisconnect:
-        logger.info(f"Vonage websocket disconnected normally: {connection_id}")
+        logger.info("Vonage websocket disconnected normally: %s", connection_id)
     except Exception as exc:
-        logger.exception(f"Error in Vonage WebSocket loop for connection {connection_id}")
+        logger.exception("Error in Vonage WebSocket loop for %s: %s", connection_id, exc)
     finally:
         if playback_task and not playback_task.done():
             playback_task.cancel()
+        if current_generation_task and not current_generation_task.done():
+            current_generation_task.cancel()
         connection_manager.disconnect(connection_id)
-        logger.info(f"Vonage WebSocket session ended: {connection_id}")
+        logger.info("Vonage WebSocket session ended: %s", connection_id)

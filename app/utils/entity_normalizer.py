@@ -149,6 +149,23 @@ def extract_phone_number(text: str) -> Tuple[bool, Optional[str], str]:
     if not text or not text.strip():
         return False, None, "empty"
 
+    lower_text = text.lower()
+
+    # Guard: If text contains time/day markers and no explicit phone indicator, it is not a phone number
+    has_time_context = bool(re.search(
+        r"\b(am|pm|a\.m\.|p\.m\.|baje|بجے|o['']?clock|morning|afternoon|evening|night|noon)\b",
+        lower_text,
+    )) or bool(re.search(
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|peer|mangal|budh|jumeraat|jumerat|jummah|jumma|hafta|itwar)\b",
+        lower_text,
+    ))
+    has_explicit_phone_marker = bool(re.search(
+        r"\b(phone|number|num|mobile|contact|digits|call|cell|فون|نمبر)\b",
+        lower_text,
+    ))
+    if has_time_context and not has_explicit_phone_marker:
+        return False, None, "no_digits"
+
     # 1. Normalize spoken words to digits
     normalized = normalize_spoken_digits(text)
 
@@ -178,22 +195,113 @@ def extract_phone_number(text: str) -> Tuple[bool, Optional[str], str]:
     if re.match(r"^03\d{9}$", digits):
         return True, digits, "valid"
 
+    # If message contains other text (like time or greeting) but has explicit phone context, extract embedded 11-digit phone
+    if has_explicit_phone_marker:
+        embedded_clean = re.sub(r"[^\d\s\+\-]", " ", text)
+        for chunk in embedded_clean.split():
+            c_digits = re.sub(r"\D", "", chunk)
+            if c_digits.startswith("0092") and len(c_digits) == 14:
+                c_digits = "0" + c_digits[4:]
+            elif c_digits.startswith("92") and len(c_digits) == 12:
+                c_digits = "0" + c_digits[2:]
+            elif c_digits.startswith("3") and len(c_digits) == 10:
+                c_digits = "0" + c_digits
+            if re.match(r"^03\d{9}$", c_digits):
+                return True, c_digits, "valid"
+
+        # Also search merged spaced digits in explicit phone context
+        match = re.search(r"(?:^|[^\d])(03\d{9})(?:[^\d]|$)", re.sub(r"\s+", "", normalized))
+        if match:
+            return True, match.group(1), "valid"
+
     if digits.startswith("03") and len(digits) < 11:
         return False, digits, "incomplete"
 
     if len(digits) != 11:
-        return False, digits, "invalid_length"
+        return False, None, "invalid_length"
 
     if not digits.startswith("03"):
-        return False, digits, "invalid_prefix"
+        return False, None, "invalid_prefix"
 
-    return False, digits, "invalid"
+    return False, None, "invalid"
+
+
+def accumulate_phone_digits(text: str, previous_digits: Optional[str] = None) -> Tuple[bool, Optional[str], str]:
+    """
+    Accumulates spoken or typed phone digits across turns.
+    Guards strictly against appending time expressions (e.g. '3 PM', 'at 4', '3 baje')
+    or day names to phone digits.
+    Returns: (is_valid: bool, canonical_or_partial_number: Optional[str], status_reason: str)
+    """
+    if not text or not text.strip():
+        if previous_digits:
+            return False, previous_digits, "incomplete" if len(previous_digits) < 11 else "invalid"
+        return False, None, "empty"
+
+    # 1. If text by itself is a complete valid phone number, use it immediately
+    is_valid, standalone_phone, reason = extract_phone_number(text)
+    if is_valid and standalone_phone:
+        return True, standalone_phone, "valid"
+    if reason == "malformed_noise":
+        return False, None, "malformed_noise"
+
+    # 2. Strict guard against time expressions or day names without phone intent
+    lower_text = text.lower()
+    has_time_context = bool(re.search(
+        r"\b(am|pm|a\.m\.|p\.m\.|baje|بجے|o['']?clock|morning|afternoon|evening|night|noon)\b",
+        lower_text,
+    )) or bool(re.search(
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|peer|mangal|budh|jumeraat|jumerat|jummah|jumma|hafta|itwar)\b",
+        lower_text,
+    ))
+    has_explicit_phone_marker = bool(re.search(
+        r"\b(phone|number|num|mobile|contact|digits|call|cell|فون|نمبر)\b",
+        lower_text,
+    ))
+
+    # If message is purely or primarily time/day context, do NOT extract its numbers as phone digits
+    if has_time_context and not has_explicit_phone_marker:
+        if previous_digits:
+            return False, previous_digits, "incomplete"
+        return False, None, "no_digits"
+
+    # 3. If there are previous partial digits starting with 03 (or country code):
+    if previous_digits:
+        prev_clean = re.sub(r"\D", "", previous_digits)
+        if prev_clean.startswith("0092") and len(prev_clean) >= 14:
+            prev_clean = "0" + prev_clean[4:]
+        elif prev_clean.startswith("92") and len(prev_clean) >= 12:
+            prev_clean = "0" + prev_clean[2:]
+        elif prev_clean.startswith("3") and len(prev_clean) >= 10:
+            prev_clean = "0" + prev_clean
+
+        norm_chunk = normalize_spoken_digits(text)
+        new_digits = re.sub(r"\D", "", norm_chunk)
+
+        if not new_digits:
+            return False, prev_clean, "incomplete"
+
+        if prev_clean.startswith("03"):
+            combined = prev_clean + new_digits
+            if len(combined) == 11 and re.match(r"^03\d{9}$", combined):
+                return True, combined, "valid"
+            elif len(combined) < 11:
+                return False, combined, "incomplete"
+            else:
+                return False, combined, "invalid_length"
+
+    # Fallback to standalone extraction
+    return is_valid, standalone_phone, reason
 
 
 def format_phone_display(phone_digits: str) -> str:
     """Formats 03XXXXXXXXX as '0345 678 8888' for human readability and speech clarity."""
+    if not phone_digits:
+        return ""
     if len(phone_digits) == 11 and phone_digits.startswith("03"):
         return f"{phone_digits[:4]} {phone_digits[4:7]} {phone_digits[7:]}"
+    if len(phone_digits) > 4:
+        return f"{phone_digits[:4]} {phone_digits[4:]}"
     return phone_digits
 
 
@@ -201,15 +309,26 @@ def format_phone_display(phone_digits: str) -> str:
 # 4. Day Extraction & Validation
 # ──────────────────────────────────────────────────────────────────────────────
 
-def extract_day(text: str) -> Optional[str]:
+import datetime
+
+_RELATIVE_DAYS = {
+    "today": 0, "aaj": 0, "آج": 0,
+    "tomorrow": 1, "kal": 1, "کل": 1,
+    "parson": 2, "parso": 2, "پرسوں": 2,
+}
+
+
+def extract_day(text: str, ref_date: Optional[datetime.date] = None) -> Optional[str]:
     """
     Extracts the canonical day name (e.g. 'Monday', 'Friday') from text.
+    Handles explicit weekday names and relative words ('today', 'tomorrow', 'aaj', 'kal', 'آج', 'کل').
     Returns None if no recognizable day name is present.
     """
     if not text:
         return None
 
     words = re.findall(r"[\w\u0600-\u06FF]+", text.lower(), flags=re.UNICODE)
+    # Check explicit weekday names first
     for word in words:
         if word in _DAYS_MAP:
             return _DAYS_MAP[word]
@@ -219,6 +338,13 @@ def extract_day(text: str) -> Optional[str]:
     for raw_key, canonical in _DAYS_MAP.items():
         if re.search(rf"\b{raw_key}\b", lower_text):
             return canonical
+
+    # Check relative day words
+    for word in words:
+        if word in _RELATIVE_DAYS:
+            offset = _RELATIVE_DAYS[word]
+            base_date = ref_date or datetime.date.today()
+            return (base_date + datetime.timedelta(days=offset)).strftime("%A")
 
     return None
 

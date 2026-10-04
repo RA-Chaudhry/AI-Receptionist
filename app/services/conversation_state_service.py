@@ -9,6 +9,7 @@ from app.utils.entity_normalizer import (
     extract_day,
     extract_time_hour,
     extract_phone_number,
+    accumulate_phone_digits,
     format_hour_display,
 )
 
@@ -134,6 +135,7 @@ class ConversationStateManager:
         entities = CollectedEntities(phone_number=phone_number)
         intent = IntentType.GENERAL
         awaiting_entity = None
+        partial_phone_digits: str | None = None
 
         for msg in messages:
             content = msg.get("content", "")
@@ -148,29 +150,32 @@ class ConversationStateManager:
                 elif any(w in content.lower() for w in ["reschedule", "change time", "move"]):
                     intent = IntentType.RESCHEDULING
 
-                # Extract phone if present
-                is_phone, phone_val, _ = extract_phone_number(content)
+                # Extract or accumulate phone number
+                is_phone, phone_val, reason = accumulate_phone_digits(content, partial_phone_digits)
                 if is_phone and phone_val:
                     entities.phone_number = phone_val
-                else:
-                    # Only extract day/time if not phone number
-                    day_val = extract_day(content)
-                    if day_val:
-                        entities.day = day_val
+                    partial_phone_digits = None
+                elif reason == "incomplete" and phone_val:
+                    partial_phone_digits = phone_val
 
-                    hour_val = extract_time_hour(content)
-                    if hour_val is not None:
-                        entities.time_str = format_hour_display(hour_val)
+                # Always extract day/time if present in message without clobbering existing
+                day_val = extract_day(content)
+                if day_val:
+                    entities.day = day_val
+
+                hour_val = extract_time_hour(content)
+                if hour_val is not None:
+                    entities.time_str = format_hour_display(hour_val)
 
             elif role == "assistant":
                 content_lower = content.lower()
-                if "phone number" in content_lower or "share your number" in content_lower:
+                if "phone number" in content_lower or "share your number" in content_lower or "remaining" in content_lower or "missed a digit" in content_lower:
                     awaiting_entity = "phone"
                 elif "what day" in content_lower or "which day" in content_lower:
                     awaiting_entity = "day"
                 elif "what time" in content_lower or "which time" in content_lower:
                     awaiting_entity = "time"
-                elif "shall i confirm" in content_lower or "confirm this booking" in content_lower:
+                elif "shall i confirm" in content_lower or "confirm this booking" in content_lower or "submit the booking" in content_lower:
                     awaiting_entity = "confirmation"
 
         state = ConversationState(

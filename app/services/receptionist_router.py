@@ -173,6 +173,7 @@ def normalise_input(text: str) -> str:
 
 from app.utils.entity_normalizer import (
     extract_phone_number as _norm_extract_phone_number,
+    accumulate_phone_digits as _norm_accumulate_phone,
     format_phone_display as _norm_format_phone_display,
     extract_day as _norm_extract_day,
     validate_day as _norm_validate_day,
@@ -235,15 +236,17 @@ def _extract_context_from_history(history: List[Dict[str, str]]) -> Dict[str, Op
     Walk through conversation history and collect:
       - selected_day  (last confirmed working day)
       - selected_time_hour (last confirmed valid hour integer)
-      - phone_number  (first valid phone number found)
+      - phone_number  (first valid phone number found or accumulated)
+      - partial_phone (accumulated partial phone digits if incomplete)
       - clarification_count (number of consecutive clarification responses by assistant)
-      - awaiting_confirmation (True, 'appointment', or 'phone')
-      - awaiting_entity (active entity context lock: 'phone', 'day', 'time', 'confirmation')
+      - awaiting_confirmation ('appointment', 'phone', or False)
+      - awaiting_entity ('phone', 'day', 'time', 'confirmation', or None)
     """
     ctx: Dict[str, object] = {
         "selected_day": None,
         "selected_time_hour": None,
         "phone_number": None,
+        "partial_phone": None,
         "clarification_count": 0,
         "awaiting_confirmation": False,
         "awaiting_entity": None,
@@ -251,6 +254,7 @@ def _extract_context_from_history(history: List[Dict[str, str]]) -> Dict[str, Op
 
     consecutive_clarifications = 0
     active_awaiting_entity = None
+    partial_phone: Optional[str] = None
 
     for msg in history:
         role    = msg.get("role", "")
@@ -260,29 +264,25 @@ def _extract_context_from_history(history: List[Dict[str, str]]) -> Dict[str, Op
         if role == "user":
             consecutive_clarifications = 0
 
-            # Entity locking check: If previous turn was awaiting a phone number, extract phone only
-            if active_awaiting_entity == "phone":
-                is_p, p_val, _ = _norm_extract_phone_number(norm)
-                if is_p and p_val:
-                    ctx["phone_number"] = p_val
-            else:
-                # Normal entity extraction with priority
-                is_p, p_val, _ = _norm_extract_phone_number(norm)
-                if is_p and p_val:
-                    if ctx["phone_number"] is None:
-                        ctx["phone_number"] = p_val
-                else:
-                    # Extract day
-                    day = _extract_day(norm)
-                    if day and day in WORKING_DAYS:
-                        ctx["selected_day"] = day.capitalize()
+            # 1. Extract day if present (working day)
+            day = _extract_day(norm)
+            if day and day in WORKING_DAYS:
+                ctx["selected_day"] = day.capitalize()
 
-                    # Extract time (strictly guarded against phone digits)
-                    hour = _extract_time_hour(norm)
-                    if hour is not None:
-                        valid, _ = validate_time(hour)
-                        if valid:
-                            ctx["selected_time_hour"] = hour
+            # 2. Extract time if present (guarded against phone digits)
+            hour = _extract_time_hour(norm)
+            if hour is not None:
+                valid, _ = validate_time(hour)
+                if valid:
+                    ctx["selected_time_hour"] = hour
+
+            # 3. Extract or accumulate phone digits
+            is_p, p_val, reason = _norm_accumulate_phone(norm, partial_phone)
+            if is_p and p_val:
+                ctx["phone_number"] = p_val
+                partial_phone = None
+            elif reason == "incomplete" and p_val:
+                partial_phone = p_val
 
         elif role == "assistant":
             content_lower = content.lower()
@@ -291,11 +291,44 @@ def _extract_context_from_history(history: List[Dict[str, str]]) -> Dict[str, Op
             else:
                 consecutive_clarifications = 0
 
-            # Detect state expectations
-            if ("scheduled for" in content_lower or "request an appointment" in content_lower) and "confirm" in content_lower:
+            # Also recover phone number from assistant confirmation prompt if present
+            if not ctx.get("phone_number"):
+                is_p_asst, p_val_asst, _ = _norm_accumulate_phone(content, None)
+                if is_p_asst and p_val_asst:
+                    ctx["phone_number"] = p_val_asst
+
+            # Detect if appointment was already booked/confirmed
+            if "is confirmed for" in content_lower or "has been confirmed" in content_lower or ("appointment" in content_lower and "confirmed" in content_lower and "ceo" in content_lower):
+                ctx["appointment_booked"] = True
+                ctx["awaiting_confirmation"] = False
+                active_awaiting_entity = None
+                ctx["selected_day"] = None
+                ctx["selected_time_hour"] = None
+                ctx["phone_number"] = None
+            # Detect if awaiting booking confirmation
+            elif (
+                "would you like me to submit" in content_lower
+                or "shall i submit" in content_lower
+                or "ready for submission" in content_lower
+                or "confirm that you want" in content_lower
+                or "submit this booking" in content_lower
+                or "submit the booking" in content_lower
+                or "confirm your appointment" in content_lower
+                or ("scheduled for" in content_lower and "confirm" in content_lower)
+                or ("request an appointment" in content_lower and "confirm" in content_lower)
+                or ("please confirm" in content_lower and "phone" not in content_lower)
+            ):
                 ctx["awaiting_confirmation"] = "appointment"
                 active_awaiting_entity = "confirmation"
-            elif "phone number" in content_lower or "share your number" in content_lower or "your number" in content_lower or "missed a digit" in content_lower:
+            # Detect if awaiting phone number (checked after submission confirmation phrases)
+            elif (
+                "phone number" in content_lower
+                or "share your number" in content_lower
+                or "your number" in content_lower
+                or "remaining" in content_lower
+                or "missed a digit" in content_lower
+                or "11-digit" in content_lower
+            ):
                 ctx["awaiting_confirmation"] = "phone"
                 active_awaiting_entity = "phone"
             elif "what day" in content_lower or "which day" in content_lower:
@@ -306,6 +339,7 @@ def _extract_context_from_history(history: List[Dict[str, str]]) -> Dict[str, Op
                 ctx["awaiting_confirmation"] = False
                 active_awaiting_entity = None
 
+    ctx["partial_phone"] = partial_phone
     ctx["clarification_count"] = consecutive_clarifications
     ctx["awaiting_entity"] = active_awaiting_entity
     return ctx
@@ -508,7 +542,7 @@ class ReceptionistRouter:
         # Detect day+time patterns even without explicit keywords like 'book'
         _has_day  = bool(_extract_day(query))
         _has_time = _extract_time_hour(query) is not None
-        is_p, p_val, p_reason = _norm_extract_phone_number(query)
+        is_p, p_val, p_reason = _norm_accumulate_phone(query, ctx.get("partial_phone"))
         has_phone_attempt = is_p or p_reason in ("incomplete", "invalid_length", "invalid_prefix", "malformed_noise")
         has_booking_keywords = bool(re.search(
             r"\b(appointment|book|schedule|meeting|slot|reserve|appoint|reschedule|i am free|i'?m free|i am available|available on|free on|free at|ملاقات|بکنگ)\b",
@@ -523,7 +557,7 @@ class ReceptionistRouter:
             (_has_day and awaiting_confirmation) or
             (_has_time and awaiting_confirmation) or
             (has_phone_attempt and (selected_day is not None or awaiting_confirmation or ctx.get("awaiting_entity") == "phone")) or
-            (awaiting_confirmation == "appointment" and bool(re.search(r"\b(yes|confirm|ok|okay|sure|correct|good|proceed|no|cancel)\b", query)))
+            (awaiting_confirmation == "appointment" and bool(re.search(r"(?:\b(yes|confirm|i confirm|go ahead|proceed|ok|okay|sure|please submit|submit it|submit|please book|book it|correct|good|sounds good|haan|ji haan|theek hai|kardein|no|cancel|different|change|another|stop|nahi)\b|ہاں|جی ہاں|ٹھیک ہے|درست|بک کریں|کر دیں|منظور|تصدیق|نہیں|منسوخ|روک دیں)", query)))
         )
 
         if is_booking_intent:
@@ -536,6 +570,11 @@ class ReceptionistRouter:
         # ── Phone number provided standalone ──────────────────────────────────
         if is_p and p_val:
             formatted_phone = _norm_format_phone_display(p_val)
+            if selected_day and selected_time_hour is not None:
+                return (
+                    f"Thank you. I have recorded your request for {selected_day} at {hour_to_display(selected_time_hour)} with phone number {formatted_phone}. "
+                    "Would you like me to submit this booking request?"
+                )
             return (
                 f"Thank you. I have recorded {formatted_phone} for this conversation. "
                 "Please provide your preferred weekday and time so I can prepare a booking request."
@@ -569,73 +608,76 @@ class ReceptionistRouter:
         phone_number        = ctx["phone_number"]
         awaiting_confirm    = ctx["awaiting_confirmation"]
         awaiting_ent        = ctx.get("awaiting_entity")
+        partial_phone       = ctx.get("partial_phone")
 
         # Try to extract day/time/phone from the current message
         current_day   = _extract_day(query)
         current_hour  = _extract_time_hour(query)
-        is_p, p_val, p_reason = _norm_extract_phone_number(query)
+        is_p, p_val, p_reason = _norm_accumulate_phone(query, partial_phone)
         current_phone = p_val if is_p else None
 
         effective_phone = current_phone or phone_number
+        day_to_use = current_day or (selected_day.lower() if selected_day else None)
+        hour_to_use = current_hour if current_hour is not None else selected_time_hour
 
         # ── Malformed noise rejected immediately without guessing ───────────
         if p_reason == "malformed_noise":
             return "I couldn't recognize that as a valid phone number. Please say your 11-digit Pakistani mobile number starting with 03 (e.g. 0345 1234567)."
 
-        # ── User provided phone number when day/time are already established ──
-        if current_phone and (selected_day or current_day or awaiting_confirm):
-            day_to_use = current_day or (selected_day.lower() if selected_day else None)
-            hour_to_use = current_hour if current_hour is not None else selected_time_hour
+        # ── User provided a valid phone number ───────────────────────────────
+        if current_phone:
             formatted_disp = _norm_format_phone_display(current_phone)
             if day_to_use and hour_to_use is not None:
+                day_cap = day_to_use.capitalize()
+                disp_time = hour_to_display(hour_to_use)
                 return (
-                    f"Thank you. I have the requested {day_to_use.capitalize()} at "
-                    f"{hour_to_display(hour_to_use)} slot and phone number {formatted_disp}. "
-                    "Please confirm that you want me to submit this booking request."
+                    f"Thank you. I have recorded your request for {day_cap} at "
+                    f"{disp_time} with phone number {formatted_disp}. "
+                    "Would you like me to submit this booking request?"
+                )
+            elif day_to_use and hour_to_use is None:
+                return (
+                    f"Thank you. I have recorded phone number {formatted_disp} for {day_to_use.capitalize()}. "
+                    "What time between 9 AM and 5 PM works for you?"
+                )
+            elif hour_to_use is not None and not day_to_use:
+                return (
+                    f"Thank you. I have recorded phone number {formatted_disp} for {hour_to_display(hour_to_use)}. "
+                    "Which weekday (Monday–Friday) would you prefer?"
                 )
             return (
                 f"Thank you. I have recorded {formatted_disp}. Please also provide the "
                 "weekday and time before I can prepare the booking request."
             )
 
-        # ── Phone in current message while awaiting phone ─────────────────────
-        if awaiting_confirm == "phone" or awaiting_ent == "phone":
-            if current_phone:
-                formatted_disp = _norm_format_phone_display(current_phone)
-                return (
-                    f"Thank you. I have recorded {formatted_disp} for this booking request. "
-                    "Please confirm the requested day and time; I will only confirm the appointment after the booking service succeeds."
-                )
-            if p_reason == "malformed_noise":
-                return "I couldn't recognize that as a valid phone number. Please say your 11-digit Pakistani mobile number starting with 03 (e.g. 0345 1234567)."
-            if p_reason in ("incomplete", "invalid_length", "invalid_prefix", "invalid") or bool(re.search(r"\d", query)):
-                return "I think I missed a digit. Could you please repeat your 11-digit phone number?"
+        # ── Incomplete phone input while awaiting phone ──────────────────────
+        if (awaiting_confirm == "phone" or awaiting_ent == "phone") and p_reason in ("incomplete", "invalid_length", "invalid_prefix", "invalid"):
+            return "I think I missed a digit. Could you please repeat your 11-digit phone number?"
 
-        # ── User confirming a proposed appointment ────────────────────────────
+        # ── User confirming or cancelling a proposed appointment ─────────────
         if awaiting_confirm == "appointment" or awaiting_ent == "confirmation":
-            if re.search(r"\b(yes|confirm|ok|okay|sure|correct|good|sounds good|proceed)\b", query):
-                if selected_day and selected_time_hour is not None:
-                    display_time = hour_to_display(selected_time_hour)
-                    if effective_phone:
-                        formatted_disp = _norm_format_phone_display(effective_phone)
-                        return (
-                            f"Thank you. The booking request for {selected_day} at {display_time} "
-                            f"with phone number {formatted_disp} is ready for submission. "
-                            "I will confirm it only after the booking service reports success."
-                        )
-                    return (
-                        f"The booking request for {selected_day} at {display_time} needs a phone number. "
-                        "Please share it before I submit the request."
-                    )
-            if re.search(r"\b(no|cancel|different|change|another)\b", query):
+            if re.search(r"(?:\b(no|cancel|different|change|another|stop|nahi|na|mat karo|badlo)\b|نہیں|منسوخ|کینسل|روکیں|روک دیں|تبدیل|بدلو)", query):
                 return (
                     "No problem! Please provide your preferred day (Monday–Friday) "
                     "and time (9 AM–5 PM) and I'll reschedule."
                 )
+            if re.search(r"(?:\b(yes|confirm|i confirm|go ahead|proceed|ok|okay|sure|please submit|submit it|submit|please book|book it|correct|good|sounds good|haan|ji haan|theek hai|kardein|kardo|sahih|drust)\b|ہاں|جی ہاں|ٹھیک ہے|درست|صحیح|بک کریں|کر دیں|کر دو|منظور|تصدیق|سبمٹ)", query):
+                if day_to_use and hour_to_use is not None:
+                    display_time = hour_to_display(hour_to_use)
+                    day_cap = day_to_use.capitalize()
+                    if effective_phone:
+                        formatted_disp = _norm_format_phone_display(effective_phone)
+                        return (
+                            f"Thank you. The booking request for {day_cap} at {display_time} "
+                            f"with phone number {formatted_disp} is ready for submission. "
+                            "I will confirm it only after the booking service reports success."
+                        )
+                    return (
+                        f"The booking request for {day_cap} at {display_time} needs a phone number. "
+                        "Please share it before I submit the request."
+                    )
 
         # ── Validate day ──────────────────────────────────────────────────────
-        day_to_use = current_day or (selected_day.lower() if selected_day else None)
-
         if day_to_use:
             valid_day, day_reason = validate_day(day_to_use)
             if not valid_day:
@@ -659,7 +701,7 @@ class ReceptionistRouter:
                             "Please choose a time between 9 AM and 5 PM on a weekday."
                         )
                     return (
-                        f"That time is outside our working hours. "
+                        "That time is outside our working hours. "
                         "I can schedule it during weekdays between 9 AM and 5 PM."
                     )
                 # Time is valid but day missing
@@ -672,8 +714,6 @@ class ReceptionistRouter:
             return APPOINTMENT_RESPONSES[0]
 
         # ── Validate time ─────────────────────────────────────────────────────
-        hour_to_use = current_hour if current_hour is not None else selected_time_hour
-
         if hour_to_use is None:
             # Day known but time missing
             return (
@@ -697,11 +737,11 @@ class ReceptionistRouter:
         display_time = hour_to_display(hour_to_use)
         day_display  = day_to_use.capitalize()
 
-        if phone_number:
+        if effective_phone:
+            formatted_disp = _norm_format_phone_display(effective_phone)
             return (
-            f"I can request an appointment with our CEO, Muhammad Ramzan, for "
-            f"{day_display} at {display_time}. "
-            "Please confirm that you want me to submit this booking request."
+                f"I have your request for {day_display} at {display_time} with phone number {formatted_disp}. "
+                "Would you like me to submit this booking request?"
             )
         return (
             f"I can request an appointment with our CEO, Muhammad Ramzan, for "

@@ -45,6 +45,8 @@ class TurnDetectorResult:
     turn_completed: bool
     audio_bytes: bytes | None = None
     state: TurnState = TurnState.IDLE
+    endpointing_delay_ms: float = 0.0
+    speech_duration_ms: float = 0.0
 
 
 class CircularAudioBuffer:
@@ -75,11 +77,20 @@ class CircularAudioBuffer:
 
 
 class VADProcessor:
-    def __init__(self, aggressiveness: int | None = None, sample_rate: int = 16000):
+    def __init__(
+        self,
+        aggressiveness: int | None = None,
+        sample_rate: int = 16000,
+        min_rms: float | None = None,
+    ):
         self.aggressiveness = aggressiveness if aggressiveness is not None else (
-            getattr(settings, "vad_aggressiveness", 1) if settings else 1
+            getattr(settings, "vad_aggressiveness", 2) if settings else 2
         )
         self.sample_rate = sample_rate
+        self.min_rms = min_rms if min_rms is not None else (
+            getattr(settings, "vad_min_rms", 100.0) if settings else 100.0
+        )
+        self.noise_floor = 40.0
         self.vad = None
 
         if webrtcvad is None:
@@ -92,13 +103,43 @@ class VADProcessor:
             logger.warning("Failed to initialize webrtcvad; falling back to fail-open VAD.", exc_info=True)
             self.vad = None
 
-    def is_speech(self, pcm_bytes: bytes) -> bool:
+    def calculate_rms(self, pcm_bytes: bytes) -> float:
+        if not pcm_bytes:
+            return 0.0
+        if np is not None:
+            samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+            if samples.size == 0:
+                return 0.0
+            return float(np.sqrt(np.mean(np.square(samples))))
+
+        total = 0.0
+        sample_count = 0
+        for index in range(0, len(pcm_bytes) - 1, 2):
+            sample = int.from_bytes(pcm_bytes[index : index + 2], byteorder="little", signed=True)
+            total += float(sample * sample)
+            sample_count += 1
+        if sample_count == 0:
+            return 0.0
+        return (total / sample_count) ** 0.5
+
+    def update_noise_floor(self, rms: float) -> None:
+        """Adapts estimated background noise floor."""
+        if rms <= 0:
+            return
+        if rms < self.noise_floor:
+            self.noise_floor = self.noise_floor * 0.8 + rms * 0.2
+        else:
+            self.noise_floor = self.noise_floor * 0.995 + rms * 0.005
+
+    def is_speech(self, pcm_bytes: bytes, override_threshold_rms: float | None = None) -> bool:
         if not pcm_bytes:
             return False
-        if self.has_silence(pcm_bytes, threshold_rms=30):
-            return False
+
+        rms = self.calculate_rms(pcm_bytes)
+        effective_threshold = override_threshold_rms or max(self.min_rms, self.noise_floor * 2.5)
+
         if self.vad is None:
-            return not self.has_silence(pcm_bytes, threshold_rms=60)
+            return rms >= effective_threshold
 
         # Accept 20ms (640 bytes) or 30ms (960 bytes) frames at 16kHz
         frame_size = int(self.sample_rate * 0.02) * 2  # 640 bytes for 20ms
@@ -114,38 +155,24 @@ class VADProcessor:
 
         speech_frames = 0
         for frame in frames:
+            frame_rms = self.calculate_rms(frame)
             try:
                 is_vad_speech = self.vad.is_speech(frame, self.sample_rate)
-                has_solid_energy = not self.has_silence(frame, threshold_rms=50)
-                if is_vad_speech or has_solid_energy:
+                # Strict condition: both VAD model AND energy threshold must agree
+                if is_vad_speech and (frame_rms >= effective_threshold):
                     speech_frames += 1
+                else:
+                    self.update_noise_floor(frame_rms)
             except Exception:
                 logger.debug("VAD frame processing failed", exc_info=True)
 
-        threshold = getattr(settings, "vad_speech_threshold", 0.3) if settings else 0.3
-        return (speech_frames / len(frames)) >= threshold
+        threshold_ratio = getattr(settings, "vad_speech_threshold", 0.3) if settings else 0.3
+        return (speech_frames / len(frames)) >= threshold_ratio
 
     def has_silence(self, pcm_bytes: bytes, threshold_rms: float = 60) -> bool:
         if not pcm_bytes:
             return True
-
-        if np is not None:
-            samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
-            if samples.size == 0:
-                return True
-            rms = float(np.sqrt(np.mean(np.square(samples))))
-            return rms < threshold_rms
-
-        total = 0.0
-        sample_count = 0
-        for index in range(0, len(pcm_bytes) - 1, 2):
-            sample = int.from_bytes(pcm_bytes[index : index + 2], byteorder="little", signed=True)
-            total += float(sample * sample)
-            sample_count += 1
-        if sample_count == 0:
-            return True
-        rms = (total / sample_count) ** 0.5
-        return rms < threshold_rms
+        return self.calculate_rms(pcm_bytes) < threshold_rms
 
 
 class PacketSanitizer:
@@ -312,10 +339,10 @@ class TurnDetector:
         self.frame_bytes = int(sample_rate * (frame_duration_ms / 1000.0) * 2)
 
         self.speech_threshold = speech_threshold if speech_threshold is not None else (
-            getattr(settings, "vad_speech_threshold", 0.5) if settings else 0.5
+            getattr(settings, "vad_speech_threshold", 0.3) if settings else 0.3
         )
         self.silence_duration_ms = silence_duration_ms if silence_duration_ms is not None else (
-            getattr(settings, "vad_silence_duration_ms", 700) if settings else 700
+            getattr(settings, "vad_silence_duration_ms", 350) if settings else 350
         )
         self.min_speech_duration_ms = min_speech_duration_ms if min_speech_duration_ms is not None else (
             getattr(settings, "vad_min_speech_duration_ms", 60) if settings else 60
@@ -324,14 +351,14 @@ class TurnDetector:
             getattr(settings, "vad_max_turn_duration_ms", 15000) if settings else 15000
         )
         self.pre_buffer_ms = pre_buffer_ms if pre_buffer_ms is not None else (
-            getattr(settings, "vad_pre_buffer_ms", 300) if settings else 300
+            getattr(settings, "vad_pre_buffer_ms", 200) if settings else 200
         )
         self.post_buffer_ms = post_buffer_ms if post_buffer_ms is not None else (
-            getattr(settings, "vad_post_buffer_ms", 200) if settings else 200
+            getattr(settings, "vad_post_buffer_ms", 150) if settings else 150
         )
 
         self.vad_processor = vad_processor or VADProcessor(
-            aggressiveness=getattr(settings, "vad_aggressiveness", 1) if settings else 1,
+            aggressiveness=getattr(settings, "vad_aggressiveness", 2) if settings else 2,
             sample_rate=sample_rate,
         )
 
@@ -382,13 +409,14 @@ class TurnDetector:
         turn_started_flag = False
         turn_completed_flag = False
         completed_audio: bytes | None = None
+        endpointing_delay = 0.0
+        speech_duration = 0.0
 
         min_speech_frames = max(1, int(self.min_speech_duration_ms / self.frame_duration_ms))
         max_silence_frames = max(1, int(self.silence_duration_ms / self.frame_duration_ms))
         max_turn_bytes = int(self.sample_rate * (self.max_turn_duration_ms / 1000.0) * 2)
 
         for frame in frames:
-
             is_frame_speech = self.vad_processor.is_speech(frame)
             if is_frame_speech:
                 overall_is_speech = True
@@ -434,14 +462,29 @@ class TurnDetector:
                     # Check if silence exceeds grace period (end of turn)
                     if self._silence_frames_count >= max_silence_frames:
                         turn_completed_flag = True
-                        completed_audio = bytes(self._active_utterance)
+                        endpointing_delay = float(self._silence_frames_count * self.frame_duration_ms)
+
+                        # Trim trailing silence beyond ~150ms to speed up STT inference
+                        max_trailing_keep_frames = max(1, int(150 / self.frame_duration_ms))
+                        if self._silence_frames_count > max_trailing_keep_frames:
+                            excess_silence_bytes = (self._silence_frames_count - max_trailing_keep_frames) * self.frame_bytes
+                            if len(self._active_utterance) > excess_silence_bytes:
+                                completed_audio = bytes(self._active_utterance[:-excess_silence_bytes])
+                            else:
+                                completed_audio = bytes(self._active_utterance)
+                        else:
+                            completed_audio = bytes(self._active_utterance)
+
+                        speech_duration = (len(completed_audio) / (self.sample_rate * 2)) * 1000.0
                         self.reset()
                         break
 
                 # Max turn duration guard
                 if len(self._active_utterance) >= max_turn_bytes:
                     turn_completed_flag = True
+                    endpointing_delay = 0.0
                     completed_audio = bytes(self._active_utterance)
+                    speech_duration = (len(completed_audio) / (self.sample_rate * 2)) * 1000.0
                     self.reset()
                     break
 
@@ -451,6 +494,8 @@ class TurnDetector:
             turn_completed=turn_completed_flag,
             audio_bytes=completed_audio,
             state=self.state,
+            endpointing_delay_ms=endpointing_delay,
+            speech_duration_ms=speech_duration,
         )
 
 
