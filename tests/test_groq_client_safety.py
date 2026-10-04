@@ -80,8 +80,9 @@ def test_groq_stream_suppresses_reasoning_deltas(monkeypatch):
 
 
 def test_groq_streaming_connection_error_fallback(monkeypatch, caplog):
-    """Verify that if streaming encounters a connection error, a clean fallback is yielded."""
+    """Verify that if streaming encounters a connection error, a clean fallback is yielded by the pipeline without secret leaks."""
     monkeypatch.setattr("app.core.config.settings.groq_api_key", "gsk_test_12345")
+    from app.services.ai_service import get_ai_response_stream
 
     class FailingResponseContext:
         async def __aenter__(self):
@@ -90,16 +91,19 @@ def test_groq_streaming_connection_error_fallback(monkeypatch, caplog):
             pass
 
     async def _run():
-        groq_svc = GroqService()
         with patch.object(httpx.AsyncClient, "stream", return_value=FailingResponseContext()):
             yielded = []
             with caplog.at_level(logging.WARNING):
-                async for token in groq_svc.chat_completion_stream([{"role": "user", "content": "hi"}]):
-                    yielded.append(token)
+                async for sentence in get_ai_response_stream(
+                    user_name="Test",
+                    user_email="test@example.com",
+                    message="Tell me something complex",
+                ):
+                    yielded.append(sentence)
 
-            full_text = "".join(yielded)
+            full_text = " ".join(yielded)
             assert len(yielded) > 0
-            assert "apologize" in full_text.lower() or "trouble" in full_text.lower()
+            assert "unavailable" in full_text.lower() or "apologize" in full_text.lower() or "representative" in full_text.lower()
             # Ensure no API keys were logged
             for record in caplog.records:
                 assert "gsk_test" not in record.message

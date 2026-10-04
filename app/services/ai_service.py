@@ -159,7 +159,15 @@ async def get_ai_response_stream(
             telemetry_recorder.mark_llm_first_token()
             telemetry_recorder.mark_llm_end()
 
-        # Split local reply into natural sentences for TTS
+        # If local reply is already cached as a unit, yield directly for instant single-chunk playback
+        from app.services.voice_service import _web_tts_cache, _tts_cache_key, _select_tts_voice
+        voice = _select_tts_voice(local_reply)
+        cache_key = _tts_cache_key(voice, local_reply)
+        if cache_key in _web_tts_cache or local_reply.strip() in _web_tts_cache:
+            yield local_reply.strip()
+            return
+
+        # Otherwise split into natural sentences for TTS
         async def _local_tokens():
             yield local_reply
 

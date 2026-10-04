@@ -682,7 +682,8 @@
       if (state.voice.isPlayingAudio) return;
       if (!state.voice.audioPlayQueue || !state.voice.audioPlayQueue.length) return;
 
-      const chunk = state.voice.audioPlayQueue.shift();
+      const item = state.voice.audioPlayQueue.shift();
+      const chunk = (item && item.bytes) ? item.bytes : item;
       const mimeType = detectMimeType(chunk);
       const audioBlob = new Blob([chunk], { type: mimeType });
       const audioUrl = URL.createObjectURL(audioBlob);
@@ -1043,6 +1044,7 @@
             mirrorVoiceMessage('user', payload.data);
           } else if (payload.type === 'response_start') {
             setTyping(true);
+            stopAudioPlayback();
             state.voice.responseCount += 1;
             setVoiceStatus({ responseCount: state.voice.responseCount });
             if (payload.data) {
@@ -1052,7 +1054,12 @@
           } else if (payload.type === 'audio_chunk') {
             const chunkBytes = base64ToBytes(payload.data);
             state.voice.audioPlayQueue = state.voice.audioPlayQueue || [];
-            state.voice.audioPlayQueue.push(chunkBytes);
+            state.voice.audioPlayQueue.push({
+              bytes: chunkBytes,
+              index: payload.index !== undefined ? payload.index : 0,
+              isFiller: !!payload.is_filler,
+            });
+            state.voice.audioPlayQueue.sort((a, b) => a.index - b.index);
             processAudioPlayQueue();
           } else if (payload.type === 'voice_interrupted') {
             setTyping(false);

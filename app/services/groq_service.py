@@ -112,9 +112,11 @@ class GroqService:
             client = get_shared_client()
             try:
                 response = await client.post(url, json=payload, headers=headers)
-                if response.status_code >= 400:
-                    logger.warning("Groq API returned HTTP status_code=%d", response.status_code)
-                    raise GroqServiceError(f"Groq API error with status {response.status_code}")
+                status = getattr(response, "status_code", 200)
+                if isinstance(status, int) and status >= 400:
+                    logger.warning("Groq API returned HTTP status_code=%d", status)
+                    raise GroqServiceError(f"Groq API request failed with status {status}")
+                response.raise_for_status()
                 data = response.json()
                 break
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout) as exc:
@@ -162,9 +164,11 @@ class GroqService:
             client = get_shared_client()
             try:
                 async with client.stream("POST", url, json=payload, headers=headers) as response:
-                    if response.status_code >= 400:
-                        logger.warning("Groq API streaming returned HTTP status_code=%d", response.status_code)
-                        raise GroqServiceError(f"Groq API error with status {response.status_code}")
+                    status = getattr(response, "status_code", 200)
+                    if isinstance(status, int) and status >= 400:
+                        logger.warning("Groq API streaming returned HTTP status_code=%d", status)
+                        raise GroqServiceError(f"Groq API request failed with status {status}")
+                    response.raise_for_status()
 
                     async for line in response.aiter_lines():
                         line = line.strip()
@@ -194,18 +198,15 @@ class GroqService:
                     await close_shared_client()
                     continue
                 logger.warning("Groq stream connection error on attempt %d: %s", attempt, type(exc).__name__)
-                break
+                raise GroqServiceError(f"Groq API streaming failed: {exc}") from exc
             except httpx.HTTPStatusError as exc:
                 logger.warning("Groq API streaming HTTP error: status_code=%d", exc.response.status_code)
-                break
+                raise GroqServiceError(f"Groq API streaming failed with status {exc.response.status_code}") from exc
             except Exception as exc:
+                if isinstance(exc, GroqServiceError):
+                    raise
                 logger.warning("Groq streaming failed: %s", type(exc).__name__)
-                break
-
-        # If stream failed without yielding any token, yield clean fallback sentence
-        if not yielded_any:
-            fallback = "I apologize, but I am currently experiencing connectivity issues. Please ask again or let me know how I can help."
-            yield fallback
+                raise GroqServiceError(f"Groq streaming failed: {exc}") from exc
 
     async def transcribe_audio_with_usage(
         self,
@@ -239,9 +240,11 @@ class GroqService:
             client = get_shared_client()
             try:
                 response = await client.post(url, headers=headers, files=files, data=data)
-                if response.status_code >= 400:
-                    logger.warning("Groq Whisper API returned HTTP status_code=%d", response.status_code)
-                    raise GroqServiceError(f"Groq Whisper transcription failed with status {response.status_code}")
+                status = getattr(response, "status_code", 200)
+                if isinstance(status, int) and status >= 400:
+                    logger.warning("Groq Whisper API returned HTTP status_code=%d", status)
+                    raise GroqServiceError(f"Groq Whisper transcription failed with status {status}")
+                response.raise_for_status()
                 res_json = response.json()
                 text = res_json.get("text", "").strip()
                 lang = res_json.get("language", "unknown")

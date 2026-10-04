@@ -423,8 +423,13 @@ def _select_tts_voice(text: str) -> str:
     return settings.tts_voice
 
 
+def _tts_cache_key(voice: str, text: str) -> str:
+    return f"{voice}:{text.strip()}"
+
+
 async def generate_tts_chunks(
     text: str,
+    voice: str | None = None,
     telemetry_recorder: VoiceTelemetryRecorder | None = None,
 ) -> AsyncGenerator[bytes, None]:
     if not text.strip():
@@ -438,7 +443,7 @@ async def generate_tts_chunks(
         if edge_tts is None:
             raise RuntimeError("edge_tts is unavailable")
 
-        voice_to_use = _select_tts_voice(text)
+        voice_to_use = voice or _select_tts_voice(text)
         communicate = edge_tts.Communicate(text, voice=voice_to_use)
         async for chunk in communicate.stream():
             if chunk.get("type") == "audio":
@@ -464,24 +469,30 @@ async def generate_tts_chunks(
             telemetry_recorder.mark_tts_end()
 
 
-async def synthesize_full_tts(text: str) -> bytes:
+async def synthesize_full_tts(text: str, voice: str | None = None) -> bytes:
     chunks = []
-    async for chunk in generate_tts_chunks(text):
+    async for chunk in generate_tts_chunks(text, voice=voice):
         chunks.append(chunk)
     return b"".join(chunks)
 
 
-async def prewarm_canned_text(text: str) -> None:
-    if not text or text in _web_tts_cache:
+async def prewarm_canned_text(text: str, voice: str | None = None) -> None:
+    if not text or len(text.strip()) > 450:
+        return
+    voice_to_use = voice or _select_tts_voice(text)
+    cache_key = _tts_cache_key(voice_to_use, text)
+    if cache_key in _web_tts_cache:
         return
     try:
-        audio = await synthesize_full_tts(text)
+        audio = await synthesize_full_tts(text, voice=voice_to_use)
         if audio:
             b64_val = base64.b64encode(audio).decode("utf-8")
-            _web_tts_cache[text] = [b64_val]
+            _web_tts_cache[cache_key] = [b64_val]
+            _web_tts_cache[text.strip()] = [b64_val]
             pcm = await asyncio.to_thread(mp3_to_pcm, audio, 16000)
             if pcm:
-                _vonage_pcm_cache[text] = pcm
+                _vonage_pcm_cache[cache_key] = pcm
+                _vonage_pcm_cache[text.strip()] = pcm
     except Exception as exc:
         logger.debug("Failed prewarming TTS for %s: %s", text[:20], exc)
 
@@ -525,6 +536,10 @@ async def prewarm_voice_cache() -> None:
 
     # Prewarm Edge-TTS in parallel tasks
     tts_tasks = [prewarm_canned_text(txt) for txt in all_texts]
+    for filler in FILLER_CLIPS:
+        tts_tasks.append(prewarm_canned_text(filler, voice="ur-PK-UzmaNeural"))
+        tts_tasks.append(prewarm_canned_text(filler, voice=settings.tts_voice))
+
     await asyncio.gather(*tts_tasks, return_exceptions=True)
     logger.info("Prewarmed %d TTS response entries into in-memory cache.", len(_web_tts_cache))
 
@@ -578,7 +593,7 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
             await _safe_send_json(websocket, {"type": "response_start", "data": ""})
 
             # Pipelined LLM and TTS Producer/Consumer
-            tts_queue: asyncio.Queue[tuple[int, str, bytes] | None] = asyncio.Queue()
+            task_queue: asyncio.Queue[asyncio.Task[tuple[int, str, bytes] | None] | None] = asyncio.Queue()
             first_audio_sent = False
             cancel_filler = asyncio.Event()
 
@@ -587,7 +602,14 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                 try:
                     await asyncio.sleep(0.700)
                     if not cancel_filler.is_set() and not first_audio_sent:
-                        filler_clip = _web_tts_cache.get("Ji,") or _web_tts_cache.get("Sure,")
+                        voice_pref = settings.tts_voice
+                        filler_clip = (
+                            _web_tts_cache.get(_tts_cache_key(voice_pref, "Ji,"))
+                            or _web_tts_cache.get(_tts_cache_key("ur-PK-UzmaNeural", "Ji,"))
+                            or _web_tts_cache.get("Ji,")
+                            or _web_tts_cache.get("Sure,")
+                            or _web_tts_cache.get(_tts_cache_key(voice_pref, "Sure,"))
+                        )
                         if filler_clip:
                             recorder.mark_send_start()
                             await _safe_send_json(
@@ -597,7 +619,7 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                                     "data": filler_clip[0],
                                     "index": -1,
                                     "is_filler": True,
-                                }
+                                },
                             )
                             recorder.mark_audio_sent()
                 except asyncio.CancelledError:
@@ -607,6 +629,22 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
 
             producer_error: Exception | None = None
             full_response_parts: list[str] = []
+
+            async def _synthesize_single_sentence(chunk_idx: int, sent_text: str) -> tuple[int, str, bytes] | None:
+                voice = _select_tts_voice(sent_text)
+                cache_key = _tts_cache_key(voice, sent_text)
+                cached = _web_tts_cache.get(cache_key) or _web_tts_cache.get(sent_text.strip())
+                if cached:
+                    full_b64 = "".join(cached)
+                    return (chunk_idx, sent_text, base64.b64decode(full_b64))
+
+                sentence_audio_parts = []
+                async for audio_chunk in generate_tts_chunks(sent_text, voice=voice, telemetry_recorder=recorder):
+                    sentence_audio_parts.append(audio_chunk)
+
+                if sentence_audio_parts:
+                    return (chunk_idx, sent_text, b"".join(sentence_audio_parts))
+                return None
 
             async def _llm_tts_producer():
                 nonlocal producer_error
@@ -625,38 +663,29 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                             continue
                         full_response_parts.append(sentence)
 
-                        # Check if sentence is pre-rendered in cache
-                        cached = _web_tts_cache.get(sentence)
-                        if cached:
-                            for part in cached:
-                                await tts_queue.put((chunk_index, sentence, base64.b64decode(part)))
-                                chunk_index += 1
-                            continue
+                        t = asyncio.create_task(_synthesize_single_sentence(chunk_index, sentence))
+                        await task_queue.put(t)
+                        chunk_index += 1
 
-                        # Synthesize TTS for this sentence
-                        sentence_audio_parts = []
-                        async for audio_chunk in generate_tts_chunks(sentence, telemetry_recorder=recorder):
-                            sentence_audio_parts.append(audio_chunk)
-
-                        if sentence_audio_parts:
-                            complete_sentence_audio = b"".join(sentence_audio_parts)
-                            await tts_queue.put((chunk_index, sentence, complete_sentence_audio))
-                            chunk_index += 1
-
-                    await tts_queue.put(None)
+                    await task_queue.put(None)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     producer_error = exc
-                    await tts_queue.put(None)
+                    await task_queue.put(None)
 
             producer_task = asyncio.create_task(_llm_tts_producer())
+            pending_synth_tasks: list[asyncio.Task] = []
 
             try:
                 while True:
-                    item = await tts_queue.get()
-                    if item is None:
+                    task = await task_queue.get()
+                    if task is None:
                         break
+                    pending_synth_tasks.append(task)
+                    item = await task
+                    if item is None:
+                        continue
 
                     chunk_idx, sent_text, audio_bytes = item
                     encoded = base64.b64encode(audio_bytes).decode("utf-8")
@@ -686,6 +715,9 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                     filler_task.cancel()
                 if not producer_task.done():
                     producer_task.cancel()
+                for t in pending_synth_tasks:
+                    if not t.done():
+                        t.cancel()
 
             full_response = " ".join(full_response_parts).strip()
             cost_obj = getattr(recorder, "cost", None)
@@ -928,27 +960,31 @@ async def play_audio_stream(
         loop = asyncio.get_running_loop()
 
         # 1. If text is pre-rendered in cache, stream immediately
-        if isinstance(text_or_stream, str) and text_or_stream in _vonage_pcm_cache:
-            pcm_bytes = _vonage_pcm_cache[text_or_stream]
-            chunk_size = 640
-            next_t = loop.time()
-            for i in range(0, len(pcm_bytes), chunk_size):
-                if cancel_event.is_set():
-                    break
-                packet = pcm_bytes[i : i + chunk_size]
-                if len(packet) < chunk_size:
-                    packet = packet + b"\x00" * (chunk_size - len(packet))
+        if isinstance(text_or_stream, str):
+            voice = _select_tts_voice(text_or_stream)
+            cache_key = _tts_cache_key(voice, text_or_stream)
+            cached_pcm = _vonage_pcm_cache.get(cache_key) or _vonage_pcm_cache.get(text_or_stream.strip())
+            if cached_pcm:
+                pcm_bytes = cached_pcm
+                chunk_size = 640
+                next_t = loop.time()
+                for i in range(0, len(pcm_bytes), chunk_size):
+                    if cancel_event.is_set():
+                        break
+                    packet = pcm_bytes[i : i + chunk_size]
+                    if len(packet) < chunk_size:
+                        packet = packet + b"\x00" * (chunk_size - len(packet))
 
-                await connection_manager.send_bytes(connection_id, packet)
-                if is_first_frame and telemetry_recorder:
-                    telemetry_recorder.mark_audio_sent()
-                    is_first_frame = False
+                    await connection_manager.send_bytes(connection_id, packet)
+                    if is_first_frame and telemetry_recorder:
+                        telemetry_recorder.mark_audio_sent()
+                        is_first_frame = False
 
-                next_t += 0.02
-                sleep_dur = next_t - loop.time()
-                if sleep_dur > 0:
-                    await asyncio.sleep(sleep_dur)
-            return
+                    next_t += 0.02
+                    sleep_dur = next_t - loop.time()
+                    if sleep_dur > 0:
+                        await asyncio.sleep(sleep_dur)
+                return
 
         async def _sentence_iter():
             if isinstance(text_or_stream, str):
@@ -969,12 +1005,15 @@ async def play_audio_stream(
                         continue
 
                     # Check cached sentence PCM
-                    if sentence in _vonage_pcm_cache:
-                        await pcm_queue.put(_vonage_pcm_cache[sentence])
+                    voice = _select_tts_voice(sentence)
+                    cache_key = _tts_cache_key(voice, sentence)
+                    cached_pcm = _vonage_pcm_cache.get(cache_key) or _vonage_pcm_cache.get(sentence.strip())
+                    if cached_pcm:
+                        await pcm_queue.put(cached_pcm)
                         continue
 
                     sentence_parts = []
-                    async for audio_chunk in generate_tts_chunks(sentence, telemetry_recorder=telemetry_recorder):
+                    async for audio_chunk in generate_tts_chunks(sentence, voice=voice, telemetry_recorder=telemetry_recorder):
                         if cancel_event.is_set():
                             break
                         sentence_parts.append(audio_chunk)
