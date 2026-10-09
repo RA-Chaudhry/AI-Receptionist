@@ -2,7 +2,7 @@ import os
 import json
 import logging
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ def log_interaction(
         return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
     log_entry = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "identifier_hash": digest(identifier),
         "query_hash": digest(query),
         "query_length": len(query),

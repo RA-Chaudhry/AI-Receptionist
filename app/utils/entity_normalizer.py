@@ -485,3 +485,41 @@ def format_hour_display(hour: int) -> str:
     if hour == 12:
         return "12 PM"
     return f"{hour - 12} PM"
+
+
+def correct_voice_vocabulary(text: str) -> str:
+    """
+    Replaces misheard STT variations of company/brand names (e.g. 'logicals',
+    'ligit pulse', 'logic pals', 'lodge pulse') with the canonical name 'Logic Pulse'.
+    Uses regex word boundaries (\\b) and sorts by length descending so multi-word
+    phrases match before single words, and normal words (e.g. 'chronological', 'illogical')
+    are never mangled.
+    """
+    if not text:
+        return text
+
+    from app.core.config import settings
+
+    corrections = getattr(settings, "vocabulary_corrections", [
+        "logicals",
+        "logical",
+        "ligit pulse",
+        "logic pals",
+        "logic pulls",
+        "lodge pulse",
+    ])
+    target = getattr(settings, "vocabulary_target", "Logic Pulse")
+
+    # Sort descending by length so multi-word variants match before single words
+    sorted_corrections = sorted(corrections, key=len, reverse=True)
+
+    result = text
+    for phrase in sorted_corrections:
+        phrase_clean = phrase.strip()
+        if not phrase_clean:
+            continue
+        pattern = rf"\b{re.escape(phrase_clean)}\b"
+        result = re.sub(pattern, target, result, flags=re.IGNORECASE)
+
+    return result
+

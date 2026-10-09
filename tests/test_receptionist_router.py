@@ -358,3 +358,133 @@ class TestUrduAndMicCheckIntents:
         r = ReceptionistRouter.get_hardcoded_response("السلام علیکم، کیا میری آواز آ رہی ہے؟", history=history)
         assert "Thursday" not in r and "3 PM" not in r
         assert "وعلیکم السلام" in r and "آواز" in r
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Router — Gratitude vs Closing Tests (Fix #4)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestGratitudeAndClosing:
+    def test_standalone_english_gratitude_does_not_close(self):
+        gratitude_phrases = ["thank you", "thanks", "ok, thank you", "okay, thank you", "thank you very much", "many thanks"]
+        for phrase in gratitude_phrases:
+            r = ReceptionistRouter.get_hardcoded_response(phrase)
+            assert r == "You're welcome! Is there anything else I can help you with?"
+
+    def test_standalone_roman_urdu_gratitude_does_not_close(self):
+        for phrase in ["shukriya", "boht shukriya", "bohat shukriya"]:
+            r = ReceptionistRouter.get_hardcoded_response(phrase)
+            assert r == "Khush amdeed! Kya main aapki kisi aur cheez mein madad kar sakta hoon?"
+
+    def test_standalone_urdu_script_gratitude_does_not_close(self):
+        for phrase in ["شکریہ", "بہت شکریہ"]:
+            r = ReceptionistRouter.get_hardcoded_response(phrase)
+            assert r == "خوش آمدید! کیا میں آپ کی کسی اور چیز میں مدد کر سکتا ہوں؟"
+
+    def test_gratitude_with_query_not_closing(self):
+        # "shukriya, mujhe pricing batao" must not be treated as closing or standalone thanks
+        r = ReceptionistRouter.get_hardcoded_response("shukriya, mujhe pricing batao")
+        # Should route to pricing response or LLM
+        assert r != "You're welcome! Is there anything else I can help you with?"
+        assert r != "Khush amdeed! Kya main aapki kisi aur cheez mein madad kar sakta hoon?"
+        assert "Aap ke rabte ka shukriya" not in str(r)
+        assert "Goodbye" not in str(r)
+
+    def test_closing_phrases_english(self):
+        for phrase in ["bye", "goodbye", "ok bye", "thank you, bye", "thanks bye", "goodbye now", "that's all", "have a nice day"]:
+            r = ReceptionistRouter.get_hardcoded_response(phrase)
+            assert "Goodbye" in r or "thank you" in r.lower()
+
+    def test_closing_phrases_roman_urdu(self):
+        for phrase in ["allah hafiz", "khuda hafiz", "alvida", "ok allah hafiz"]:
+            r = ReceptionistRouter.get_hardcoded_response(phrase)
+            assert "Allah Hafiz" in r
+
+    def test_closing_phrases_urdu_script(self):
+        for phrase in ["اللہ حافظ", "خدا حافظ", "الوداع", "بس شکریہ"]:
+            r = ReceptionistRouter.get_hardcoded_response(phrase)
+            assert "اللہ حافظ" in r
+
+    def test_greeting_how_are_you_natural_reply(self):
+        r_en = ReceptionistRouter.get_hardcoded_response("Hi, how are you?")
+        assert r_en is not None
+        assert "well" in r_en.lower() or "great" in r_en.lower()
+        assert "Logic Pulse" in r_en
+
+        r_ur = ReceptionistRouter.get_hardcoded_response("Salam, kese ho aap?")
+        assert r_ur is not None
+        assert "theek" in r_ur.lower()
+        assert "Logic Pulse" in r_ur
+
+    def test_greeting_natural_variations_across_turns(self):
+        h0 = []
+        h1 = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "Hello"}]
+        r0 = ReceptionistRouter.get_hardcoded_response("Hello", history=h0)
+        r1 = ReceptionistRouter.get_hardcoded_response("Hello", history=h1)
+        assert r0 is not None and r1 is not None
+        assert "Logic Pulse" in r0 and "Logic Pulse" in r1
+
+    def test_gratitude_in_appointment_flow_retains_context(self):
+        history = [
+            {"role": "user", "content": "I want an appointment with Mr. Ramzan"},
+            {"role": "assistant", "content": "I'd be happy to schedule an appointment with our CEO, Muhammad Ramzan. What day and time works for you?"},
+        ]
+        r = ReceptionistRouter.get_hardcoded_response("Thank you.", history=history)
+        assert r is not None
+        assert "appointment" in r.lower() or "day" in r.lower()
+        assert "Is there anything else I can help you with?" not in r
+
+    def test_repeated_gratitude_closes_gracefully(self):
+        history = [
+            {"role": "user", "content": "Thank you."},
+            {"role": "assistant", "content": "You're welcome! Is there anything else I can help you with?"},
+        ]
+        r = ReceptionistRouter.get_hardcoded_response("Thank you.", history=history)
+        assert r is not None
+        assert "Goodbye" in r or "thank you for contacting" in r.lower()
+
+    def test_hesitation_phrase_does_not_escalate(self):
+        history = [
+            {"role": "user", "content": "I took it away"},
+            {"role": "assistant", "content": "Could you please clarify what you mean by 'I took it away'?"},
+        ]
+        r = ReceptionistRouter.get_hardcoded_response("I think", history=history)
+        # Should NOT trigger fallback to human agent; should delegate to LLM (None)
+        assert r is None
+
+    def test_standalone_acknowledgments_zero_api_cost(self):
+        # Conversational fillers / acknowledgments must be answered locally with zero LLM API calls
+        fillers = ["All right.", "Alright", "Right.", "So,", "Okay.", "Ok", "Yeah.", "Sure."]
+        for filler in fillers:
+            r = ReceptionistRouter.get_hardcoded_response(filler)
+            assert r is not None, f"Expected local response for filler '{filler}', got None"
+            assert ("help" in r.lower() or "assist" in r.lower() or "listening" in r.lower() or "services" in r.lower())
+
+    def test_standalone_acknowledgments_urdu_and_roman(self):
+        # Urdu and Roman Urdu acknowledgments
+        r_roman = ReceptionistRouter.get_hardcoded_response("Theek hai")
+        assert r_roman is not None
+        assert "madad" in r_roman.lower() or "sun raha hoon" in r_roman.lower()
+
+        r_urdu = ReceptionistRouter.get_hardcoded_response("ٹھیک ہے")
+        assert r_urdu is not None
+        assert "مدد" in r_urdu or "سن رہا ہوں" in r_urdu
+
+    def test_acknowledgment_during_appointment_booking(self):
+        history = [
+            {"role": "user", "content": "I want to book an appointment with your CEO."},
+            {"role": "assistant", "content": "I'd be happy to schedule an appointment with our CEO, Muhammad Ramzan. What day and time works for you?"},
+        ]
+        r = ReceptionistRouter.get_hardcoded_response("All right.", history=history)
+        assert r is not None
+        assert "day" in r.lower() or "time" in r.lower() or "appointment" in r.lower()
+
+    def test_all_right_confirms_appointment(self):
+        history = [
+            {"role": "user", "content": "I want to book an appointment with your CEO for Wednesday at 3 PM. My number is 03001234567."},
+            {"role": "assistant", "content": "I have recorded your request for Wednesday at 3 PM with phone number 0300 1234567. Would you like me to submit this booking request?"},
+        ]
+        r = ReceptionistRouter.get_hardcoded_response("All right.", history=history)
+        assert r is not None
+        assert "submitted" in r.lower() or "confirm" in r.lower()
+

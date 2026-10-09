@@ -186,7 +186,7 @@ def test_groq_whisper_transcribe_audio_with_usage():
 def test_transcribe_audio_bytes_groq_whisper_path():
     """Verify transcribe_audio_bytes routes to Groq Whisper when configured."""
     async def _run():
-        dummy_pcm = b"\x00\x00" * 16000  # 1 second of silence PCM
+        dummy_pcm = b"\x10\x10" * 16000  # 1 second of audible non-zero PCM
         recorder = VoiceTelemetryRecorder()
 
         with patch("app.core.config.settings.stt_provider", "groq_whisper"), \
@@ -208,7 +208,7 @@ def test_transcribe_audio_bytes_groq_whisper_path():
 def test_transcribe_audio_bytes_groq_failure_fallback_to_whisper():
     """Verify that if Groq Whisper fails, transcribe_audio_bytes falls back to local Whisper."""
     async def _run():
-        dummy_pcm = b"\x00\x00" * 16000
+        dummy_pcm = b"\x10\x10" * 16000
         recorder = VoiceTelemetryRecorder()
 
         mock_whisper_instance = MagicMock()

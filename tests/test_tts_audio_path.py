@@ -74,6 +74,9 @@ def test_router_reply_hits_cache_with_zero_edge_tts_calls():
             nonlocal step
             if step == 0:
                 step += 1
+                return {"bytes": b"\x10\x10" * 8000}
+            if step == 1:
+                step += 1
                 return {"text": '{"type": "speech_ended"}'}
             while not any(m.get("type") == "response_end" for m in sent_messages):
                 await asyncio.sleep(0.01)
@@ -128,6 +131,9 @@ def test_pipelined_sentence_ordering_reversed_completion():
         async def mock_receive():
             nonlocal step
             if step == 0:
+                step += 1
+                return {"bytes": b"\x10\x10" * 8000}
+            if step == 1:
                 step += 1
                 return {"text": '{"type": "speech_ended"}'}
             while not any(m.get("type") == "response_end" for m in sent_messages):
@@ -204,6 +210,9 @@ def test_filler_clip_fires_on_slow_llm_and_skips_on_fast_turn():
             nonlocal step_slow
             if step_slow == 0:
                 step_slow += 1
+                return {"bytes": b"\x20\x20" * 8000}
+            if step_slow == 1:
+                step_slow += 1
                 return {"text": '{"type": "speech_ended"}'}
             while not any(m.get("type") == "response_end" for m in sent_messages_slow):
                 await asyncio.sleep(0.01)
@@ -253,6 +262,9 @@ def test_filler_clip_fires_on_slow_llm_and_skips_on_fast_turn():
         async def mock_receive_fast():
             nonlocal step_fast
             if step_fast == 0:
+                step_fast += 1
+                return {"bytes": b"\x20\x20" * 8000}
+            if step_fast == 1:
                 step_fast += 1
                 return {"text": '{"type": "speech_ended"}'}
             while not any(m.get("type") == "response_end" for m in sent_messages_fast):

@@ -25,10 +25,15 @@ logger = logging.getLogger(__name__)
 
 GREETING_RESPONSES = [
     "Hello, welcome to Logic Pulse. How can I assist you?",
-    "Hi, you've reached Logic Pulse. How may I help you today?",
-    "Welcome! Please let me know your query.",
-    "Good day! I'm here to help. What can I do for you?",
-    "I'm here to assist you. Please tell me your request.",
+    "Hi, welcome to Logic Pulse! How may I help you today?",
+    "Welcome to Logic Pulse! What can I do for you today?",
+    "Good day! Welcome to Logic Pulse. How can I assist you?",
+    "Hello! Welcome to Logic Pulse. How can I help you today?",
+]
+
+HOW_ARE_YOU_RESPONSES = [
+    "Hello! I'm doing well, thank you. Welcome to Logic Pulse, how can I assist you today?",
+    "Hi! I'm doing great, thank you for asking. Welcome to Logic Pulse, how can I help you today?",
 ]
 
 TIMING_RESPONSES = [
@@ -89,6 +94,23 @@ CLOSING_RESPONSES = [
     "You will receive an update soon. Have a great day!",
     "Goodbye, and thank you for contacting Logic Pulse!",
     "It was a pleasure assisting you. Take care!",
+]
+
+ACKNOWLEDGMENT_RESPONSES = [
+    "I'm here to help. What service or information are you looking for?",
+    "Sure! How can I assist you today?",
+    "I'm listening, please go ahead.",
+    "Feel free to ask about our services, pricing, or scheduling an appointment.",
+]
+
+ACKNOWLEDGMENT_RESPONSES_URDU = [
+    "جی فرمائیے، میں آپ کی کیا مدد کر سکتا ہوں؟",
+    "میں سن رہا ہوں، بتائیے آپ کو کیا معلومات درکار ہیں؟",
+]
+
+ACKNOWLEDGMENT_RESPONSES_ROMAN_URDU = [
+    "Ji farmayein, main aapki kya madad kar sakta hoon?",
+    "Main sun raha hoon, batayein aapko kya maloomat chahiye?",
 ]
 
 # Substring triggers used to detect clarification assistant messages in history
@@ -483,17 +505,72 @@ class ReceptionistRouter:
 
         # ── Greeting ──────────────────────────────────────────────────────────
         if has_greeting:
+            turn_idx = len(history)
+            is_asking_how = bool(re.search(r"\b(how are you|how r u|how do you do|how are you doing|how is it going|how are things)\b", query))
             if re.search(r"[\u0600-\u06FF]", query):
+                if is_asking_how:
+                    return "وعلیکم السلام! میں بالکل ٹھیک ہوں۔ Logic Pulse میں خوش آمدید، فرمائیے میں آپ کی کیا مدد کر سکتا ہوں؟"
                 return "وعلیکم السلام! Logic Pulse میں خوش آمدید۔ میں آپ کی کیا مدد کر سکتا ہوں؟"
             if re.search(r"\b(salam|assalam|aslam|kese|haal)\b", query):
+                if is_asking_how or re.search(r"\b(kese|haal)\b", query):
+                    return "Walaikum Assalam! Main bilkul theek hoon, shukriya. Logic Pulse mein khushamdeed, main aapki kya madad kar sakta hoon?"
                 return "Walaikum Assalam! Logic Pulse mein khushamdeed. Main aapki kya madad kar sakta hoon?"
-            return GREETING_RESPONSES[0]
+            if is_asking_how:
+                return HOW_ARE_YOU_RESPONSES[turn_idx % len(HOW_ARE_YOU_RESPONSES)]
+            return GREETING_RESPONSES[turn_idx % len(GREETING_RESPONSES)]
 
-        # ── Closing ───────────────────────────────────────────────────────────
-        if re.search(r"\b(bye|goodbye|exit|quit|end|thank you|thanks|khuda hafiz|allah hafiz|shukriya|boht shukriya|شکریہ|اللہ حافظ|خدا حافظ)\b", query):
+        # ── Gratitude (standalone: "thank you", "thanks", "shukriya") ────────
+        # Plain gratitude must NOT end the call or disrupt an ongoing booking flow.
+        clean_words = re.sub(r"[^\w\s\u0600-\u06FF]", " ", query).split()
+        cleaned_no_punct = " ".join(clean_words)
+
+        is_standalone_thanks = bool(re.fullmatch(
+            r"(thank\s+you(\s+very\s+much)?|thanks(\s+a\s+lot)?|many\s+thanks|ok\s+thank\s+you|okay\s+thank\s+you|shukriya|boht\s+shukriya|bohat\s+shukriya|shukria|بہت\s*شکریہ|شکریہ)",
+            cleaned_no_punct,
+            re.IGNORECASE,
+        ))
+        if is_standalone_thanks:
+            # 1. If currently in the appointment flow or awaiting info, do NOT lose the booking context!
+            if ctx.get("awaiting_entity") in ("day", "time", "day_time", "phone", "confirmation") or awaiting_confirmation:
+                if re.search(r"[\u0600-\u06FF]", query):
+                    return "خوش آمدید! اپائنٹمنٹ بک کرنے کے لیے برائے مہربانی اپنا پسندیدہ دن اور وقت بتائیں۔"
+                if re.search(r"\b(shukriya|shukria)\b", query):
+                    return "Khush amdeed! Appointment ke liye barah-e-karam apna pasandeeda din aur waqt batayein."
+                return "You're welcome! To proceed with your appointment, please let me know what day and time works for you."
+
+            # 2. Prevent infinite 'thank you' / 'you're welcome' loops
+            last_asst_msg = next((m.get("content", "") for m in reversed(history) if m.get("role") == "assistant"), "")
+            if "you're welcome" in last_asst_msg.lower() or "khush amdeed" in last_asst_msg.lower() or "خوش آمدید" in last_asst_msg:
+                return CLOSING_RESPONSES[3]  # "Goodbye, and thank you for contacting Logic Pulse!"
+
+            if re.search(r"[\u0600-\u06FF]", query):
+                return "خوش آمدید! کیا میں آپ کی کسی اور چیز میں مدد کر سکتا ہوں؟"
+            if re.search(r"\b(shukriya|shukria|boht|bohat)\b", query):
+                return "Khush amdeed! Kya main aapki kisi aur cheez mein madad kar sakta hoon?"
+            return "You're welcome! Is there anything else I can help you with?"
+
+        # ── Closing / Farewell (whole utterance must be an explicit closing) ──
+        is_explicit_closing = False
+        closing_exact_phrases = {
+            "bye", "goodbye", "good bye", "bye bye", "ok bye", "okay bye", "bye now", "goodbye now",
+            "thanks bye", "thank you bye", "allah hafiz", "khuda hafiz", "alvida", "that's all",
+            "thats all", "that is all", "nothing else", "no that's all", "no thats all",
+            "goodbye have a nice day", "have a nice day", "take care",
+            "allah hafiz bye", "ok bye thank you",
+            "اللہ حافظ", "خدا حافظ", "الوداع", "بس شکریہ", "اور کچھ نہیں"
+        }
+        if (
+            cleaned_no_punct in closing_exact_phrases
+            or query.strip() in closing_exact_phrases
+            or bool(re.fullmatch(r"((ok|okay|thank\s+you|thanks)\s+)?(bye|goodbye|allah\s*hafiz|khuda\s*hafiz|alvida)(\s+(now|sir|madam|have\s+a\s+nice\s+day))?", cleaned_no_punct, re.IGNORECASE))
+            or bool(re.fullmatch(r"(اللہ\s*حافظ|خدا\s*حافظ|الوداع|بس\s*شکریہ|اور\s*کچھ\s*نہیں)", cleaned_no_punct))
+        ):
+            is_explicit_closing = True
+
+        if is_explicit_closing:
             if re.search(r"[\u0600-\u06FF]", query):
                 return "آپ کے رابطے کا شکریہ! Logic Pulse سے رابطہ کرنے کے لیے خوش آمدید۔ اللہ حافظ!"
-            if re.search(r"\b(shukriya|allah hafiz|khuda hafiz)\b", query):
+            if re.search(r"\b(allah hafiz|khuda hafiz|alvida)\b", query):
                 return "Aap ke rabte ka shukriya! Logic Pulse se rabta karne ke liye khushamdeed. Allah Hafiz!"
             return CLOSING_RESPONSES[3]
 
@@ -566,7 +643,7 @@ class ReceptionistRouter:
             (_has_day and awaiting_confirmation) or
             (_has_time and awaiting_confirmation) or
             (has_phone_attempt and (selected_day is not None or awaiting_confirmation or ctx.get("awaiting_entity") == "phone")) or
-            (awaiting_confirmation == "appointment" and bool(re.search(r"(?:\b(yes|confirm|i confirm|go ahead|proceed|ok|okay|sure|please submit|submit it|submit|please book|book it|correct|good|sounds good|haan|ji haan|theek hai|kardein|no|cancel|different|change|another|stop|nahi)\b|ہاں|جی ہاں|ٹھیک ہے|درست|بک کریں|کر دیں|منظور|تصدیق|نہیں|منسوخ|روک دیں)", query)))
+            (awaiting_confirmation == "appointment" and bool(re.search(r"(?:\b(yes|confirm|i confirm|go ahead|proceed|ok|okay|all right|alright|sure|please submit|submit it|submit|please book|book it|correct|good|sounds good|haan|ji haan|theek hai|kardein|no|cancel|different|change|another|stop|nahi)\b|ہاں|جی ہاں|ٹھیک ہے|درست|بک کریں|کر دیں|منظور|تصدیق|نہیں|منسوخ|روک دیں)", query)))
         )
 
         if is_booking_intent:
@@ -593,6 +670,37 @@ class ReceptionistRouter:
                 return "I couldn't recognize that as a valid phone number. Please say your 11-digit Pakistani mobile number starting with 03 (e.g. 0345 1234567)."
             if p_reason in ("incomplete", "invalid_length", "invalid_prefix", "invalid"):
                 return "I think I missed a digit. Could you please repeat your 11-digit phone number?"
+
+        # ── Conversational hesitation / thinking phrases ("i think", "wait", "let me see") ───
+        is_hesitation = bool(re.fullmatch(r"(i think(\s+so)?|let me (think|see|check)|wait(\s+a\s+(second|sec|moment|minute))?|just a (second|moment|minute)|well|um+|hm+|one second)", query.strip(), re.IGNORECASE))
+        if is_hesitation:
+            logger.info("Conversational hesitation detected ('%s') — delegating to Groq LLM.", query)
+            return None
+
+        # ── Standalone acknowledgments & conversational fillers ("all right", "okay", "yeah", "right", "so", "theek hai") ──
+        is_acknowledgment = bool(re.fullmatch(
+            r"(all\s+right(\s+then)?|alright(\s+then)?|right|so|okay(\s+then)?|ok(\s+then)?|yeah|yep|yup|yes|sure(\s+thing)?|fine|i\s+see|got\s+it|understood|i\s+understand|"
+            r"theek\s+hai|theek|theek\s+hay|haan|han|jee|ji|jee\s+haan|ji\s+haan|sahi|sahi\s+hai|acha|achha|acha\s+theek|"
+            r"ٹھیک\s*ہے|ٹھیک|ہاں|جی|جی\s*ہاں|صحیح|اوکے|اچھا)",
+            cleaned_no_punct,
+            re.IGNORECASE,
+        ))
+        if is_acknowledgment:
+            if ctx.get("awaiting_entity") in ("day", "time", "day_time"):
+                if re.search(r"[\u0600-\u06FF]", query):
+                    return "برائے مہربانی اپنا پسندیدہ دن (پیر تا جمعہ) اور وقت (صبح 9 تا شام 5) بتائیں۔"
+                if re.search(r"\b(din|waqt|batayein)\b", query):
+                    return "Barah-e-karam apna pasandeeda din (Monday to Friday) aur waqt (9 AM to 5 PM) batayein."
+                return "Please let me know your preferred day (Monday to Friday) and time (9 AM to 5 PM) for the appointment."
+            if ctx.get("awaiting_entity") == "phone":
+                return "Please share your 11-digit mobile number so I can confirm your booking."
+
+            turn_idx = len(history)
+            if re.search(r"[\u0600-\u06FF]", query):
+                return ACKNOWLEDGMENT_RESPONSES_URDU[turn_idx % len(ACKNOWLEDGMENT_RESPONSES_URDU)]
+            if re.search(r"\b(theek|haan|jee|ji|sahi|acha|achha)\b", query):
+                return ACKNOWLEDGMENT_RESPONSES_ROMAN_URDU[turn_idx % len(ACKNOWLEDGMENT_RESPONSES_ROMAN_URDU)]
+            return ACKNOWLEDGMENT_RESPONSES[turn_idx % len(ACKNOWLEDGMENT_RESPONSES)]
 
         # ── Unknown / unmatched ───────────────────────────────────────────────
         if clarification_count >= 1:

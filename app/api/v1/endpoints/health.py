@@ -70,7 +70,6 @@ async def voice_health():
             "web_tts_cache_count": len(_web_tts_cache),
             "vonage_pcm_cache_count": len(_vonage_pcm_cache),
         },
-        "history_cache_size": len(_web_tts_cache),
         "last_5_turn_totals": get_recent_turn_totals(),
         "demo_mode": getattr(settings, "demo_mode", False),
     }

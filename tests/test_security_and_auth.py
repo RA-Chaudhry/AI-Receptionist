@@ -68,3 +68,77 @@ def test_rate_limit_bypasses_docs(client: TestClient, monkeypatch):
     # Documentation route should still succeed
     docs_res = client.get("/openapi.json")
     assert docs_res.status_code == 200
+
+
+def test_production_startup_fails_without_admin_api_key(monkeypatch):
+    """In production environment, fail fast if ADMIN_API_KEY is empty."""
+    import asyncio
+    from app.main import lifespan
+
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "admin_api_key", "")
+    monkeypatch.setattr(settings, "voice_websocket_token", "valid_ws_token")
+
+    async def _test():
+        with pytest.raises(RuntimeError, match="ADMIN_API_KEY must be set"):
+            async with lifespan(app):
+                pass
+
+    asyncio.run(_test())
+
+
+def test_production_startup_fails_without_websocket_token(monkeypatch):
+    """In production environment, fail fast if VOICE_WEBSOCKET_TOKEN is empty."""
+    import asyncio
+    from app.main import lifespan
+
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "admin_api_key", "valid_admin_key")
+    monkeypatch.setattr(settings, "voice_websocket_token", "")
+
+    async def _test():
+        with pytest.raises(RuntimeError, match="VOICE_WEBSOCKET_TOKEN must be set"):
+            async with lifespan(app):
+                pass
+
+    asyncio.run(_test())
+
+
+def test_development_startup_succeeds_without_keys(monkeypatch):
+    """In development/test, server starts cleanly even if keys are unset."""
+    import asyncio
+    from app.main import lifespan
+
+    monkeypatch.setattr(settings, "environment", "development")
+    monkeypatch.setattr(settings, "admin_api_key", "")
+    monkeypatch.setattr(settings, "voice_websocket_token", "")
+
+    async def _test():
+        async with lifespan(app):
+            pass
+
+    asyncio.run(_test())
+
+
+def test_call_language_cache_cleared_on_disconnect():
+    """Verify _call_language_cache is cleared in finally block on disconnect."""
+    import asyncio
+    from unittest.mock import AsyncMock
+    from app.services.voice_service import process_voice_websocket, _call_language_cache
+
+    mock_ws = AsyncMock()
+    # Mock receive to disconnect immediately
+    from fastapi.websockets import WebSocketDisconnect
+    mock_ws.receive.side_effect = WebSocketDisconnect()
+
+    async def _test():
+        initial_count = len(_call_language_cache)
+        try:
+            await process_voice_websocket(mock_ws, phone_number=None)
+        except WebSocketDisconnect:
+            pass
+        # Ensure no residual entries leaked
+        assert len(_call_language_cache) == initial_count
+
+    asyncio.run(_test())
+

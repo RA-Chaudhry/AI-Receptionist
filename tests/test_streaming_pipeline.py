@@ -181,8 +181,8 @@ def test_get_ai_response_stream_groq_layer(mock_groq):
 def test_websocket_streaming_speech_turn(client: TestClient, mock_groq, mock_voice_environment):
     """Verify full-duplex WebSocket streams response_start, audio_chunk frames, and response_end."""
     with client.websocket_connect("/api/v1/voice/stream?phone_number=03001234567") as ws:
-        # Send synthetic audio frames
-        ws.send_bytes(b"\x00\x00" * 320)
+        # Send synthetic audio frames (500ms)
+        ws.send_bytes(b"\x10\x10" * 8000)
         resp1 = ws.receive_json()
         assert resp1["type"] == "listening"
 

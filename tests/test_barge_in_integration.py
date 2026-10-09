@@ -52,9 +52,9 @@ def test_websocket_barge_in_during_active_turn(client: TestClient, mock_voice_en
     when caller speaks during assistant playback.
     """
     with client.websocket_connect("/api/v1/voice/stream?phone_number=%2B923001234567") as ws:
-        # 1. User sends first turn
-        speech_300ms = generate_pcm_sine(300)
-        ws.send_bytes(speech_300ms)
+        # 1. User sends first turn (>=400ms)
+        speech_600ms = generate_pcm_sine(600)
+        ws.send_bytes(speech_600ms)
         # 700ms silence completes turn 1
         ws.send_bytes(generate_silence(700))
 
@@ -71,8 +71,8 @@ def test_websocket_barge_in_during_active_turn(client: TestClient, mock_voice_en
 
         assert any(e.get("type") in ("listening", "transcript", "response_start", "audio_chunk", "response_end") for e in events)
 
-        # 3. Caller barges in with new speech while assistant is speaking
-        ws.send_bytes(speech_300ms)
+        # 3. Caller barges in with new speech while assistant is speaking (>=450ms)
+        ws.send_bytes(speech_600ms)
 
         # 4. Check for voice_interrupted or listening
         barge_in_events = []
@@ -102,7 +102,7 @@ def test_websocket_multiple_rapid_interruptions(client: TestClient, mock_voice_e
             assert msg.get("type") == "voice_interrupted"
 
         # Session remains completely healthy and responsive
-        ws.send_bytes(generate_pcm_sine(300))
+        ws.send_bytes(generate_pcm_sine(600))
         ws.send_bytes(generate_silence(700))
         
         # Drain responses
@@ -124,13 +124,13 @@ def test_conversation_context_preserved_across_interruptions(client: TestClient,
     phone = "+923009998877"
     with client.websocket_connect(f"/api/v1/voice/stream?phone_number={phone}") as ws:
         # Turn 1
-        ws.send_bytes(generate_pcm_sine(300))
+        ws.send_bytes(generate_pcm_sine(600))
         ws.send_bytes(generate_silence(700))
 
         # Drain turn 1
         for _ in range(5):
             try:
-                ws.receive_json()
+                msg = ws.receive_json()
             except Exception:
                 break
 
@@ -139,7 +139,7 @@ def test_conversation_context_preserved_across_interruptions(client: TestClient,
         ws.receive_json()
 
         # Turn 2
-        ws.send_bytes(generate_pcm_sine(300))
+        ws.send_bytes(generate_pcm_sine(600))
         ws.send_bytes(generate_silence(700))
 
         # Drain turn 2

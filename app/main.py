@@ -23,6 +23,12 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if settings.environment == "production":
+        if not settings.admin_api_key or not settings.admin_api_key.strip():
+            raise RuntimeError("Production startup failure: ADMIN_API_KEY must be set and non-empty.")
+        if not settings.voice_websocket_token or not settings.voice_websocket_token.strip():
+            raise RuntimeError("Production startup failure: VOICE_WEBSOCKET_TOKEN must be set and non-empty.")
+
     # Schema changes are applied exclusively by Alembic.  Calling create_all at
     # runtime masks missing migrations and can create a schema different from
     # the one production deployments actually run.
@@ -93,7 +99,11 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 @app.get("/", tags=["Frontend"])
 async def root():
     frontend_file = Path(__file__).resolve().parents[1] / "frontend" / "index.html"
-    return FileResponse(frontend_file)
+    response = FileResponse(frontend_file)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 @app.get("/health", tags=["Health"])

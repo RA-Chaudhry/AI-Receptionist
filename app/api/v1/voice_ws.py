@@ -26,10 +26,10 @@ async def voice_stream(
         await process_voice_websocket(websocket, phone_number)
     except WebSocketDisconnect:
         logger.info("Voice websocket disconnected normally")
-    except Exception as exc:
+    except Exception:
         logger.exception("Voice websocket error")
         try:
-            await websocket.send_json({"type": "error", "data": str(exc)})
+            await websocket.send_json({"type": "error", "data": "Internal server error occurred"})
         except Exception:
             pass
     finally:

@@ -21,10 +21,22 @@ class Settings(BaseSettings):
     stt_provider: str = "groq_whisper"  # "faster_whisper", "groq_whisper"
     groq_whisper_model: str = "whisper-large-v3-turbo"
     whisper_model: str = "base"
+    whisper_language: str = "en"
+    vocabulary_corrections: list[str] = [
+        "logicals",
+        "logical",
+        "ligit pulse",
+        "logic pals",
+        "logic pulls",
+        "lodge pulse",
+    ]
+    vocabulary_target: str = "Logic Pulse"
     vad_min_rms: float = 100.0
-    vad_aggressiveness: int = 2
+    min_stt_rms: float = 70.0
+    min_stt_duration_ms: int = 400
+    vad_aggressiveness: int = 3
     vad_speech_threshold: float = 0.3
-    vad_silence_duration_ms: int = 350
+    vad_silence_duration_ms: int = 450
     vad_min_speech_duration_ms: int = 60
     vad_max_turn_duration_ms: int = 15000
     vad_pre_buffer_ms: int = 200
@@ -57,8 +69,10 @@ class Settings(BaseSettings):
 
     # Telemetry and VAD / Barge-In Configuration
     telemetry_log_file: str = "logs/telemetry.jsonl"
-    barge_in_guard_ms: int = 300
-    barge_in_min_speech_ms: int = 200
+    barge_in_guard_ms: int = 800
+    barge_in_min_speech_ms: int = 450
+    barge_in_min_rms: float = 120.0
+    barge_in_rms_multiplier: float = 3.0
     demo_mode: bool = False
 
     # SMS Configuration

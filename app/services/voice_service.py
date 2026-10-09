@@ -15,6 +15,10 @@ from collections import defaultdict
 from typing import AsyncGenerator
 from uuid import uuid4
 
+import math
+from pathlib import Path
+import struct
+
 import httpx
 from fastapi import WebSocket
 from fastapi.websockets import WebSocketDisconnect
@@ -30,9 +34,10 @@ from app.crud.chat import chat_crud
 from app.crud.user import user_crud
 from app.db.session import async_session_maker
 from app.services.ai_service import get_ai_response, get_ai_response_stream
-from app.services.groq_service import GroqService, GroqServiceError, get_shared_client
+from app.services.groq_service import GroqService, GroqServiceError, get_shared_client, normalize_whisper_language, is_prompt_echo
 from app.services.receptionist_router import (
     GREETING_RESPONSES,
+    HOW_ARE_YOU_RESPONSES,
     TIMING_RESPONSES,
     LOCATION_RESPONSES,
     SERVICES_RESPONSES,
@@ -41,9 +46,11 @@ from app.services.receptionist_router import (
     CLARIFICATION_RESPONSES,
     FALLBACK_RESPONSES,
     CLOSING_RESPONSES,
+    ACKNOWLEDGMENT_RESPONSES,
 )
 from app.services.telemetry import VoiceTelemetryRecorder
 from app.utils.audio_buffer import VADProcessor, TurnDetector, pcm_to_wav, mp3_to_pcm, wav_to_pcm
+from app.utils.entity_normalizer import correct_voice_vocabulary
 from app.utils.prompts import voice_receptionist_prompt
 
 try:
@@ -73,44 +80,140 @@ _vonage_pcm_cache: dict[str, bytes] = {}
 _call_language_cache: dict[str, str] = {}
 _prewarm_done: bool = False
 
+TTS_DISK_CACHE_DIR = Path("data/tts_cache")
+
+
+def _calculate_pcm_rms(audio_bytes: bytes) -> float:
+    """Calculates RMS energy from 16-bit mono PCM bytes."""
+    if len(audio_bytes) < 2:
+        return 0.0
+    count = len(audio_bytes) // 2
+    samples = struct.unpack(f"<{count}h", audio_bytes[: count * 2])
+    sum_sq = sum(s * s for s in samples)
+    return math.sqrt(sum_sq / count) if count > 0 else 0.0
+
+
+def load_tts_disk_cache() -> None:
+    """Loads pre-rendered TTS files from persistent disk storage into memory on startup."""
+    if not TTS_DISK_CACHE_DIR.exists():
+        return
+    count = 0
+    try:
+        manifest_path = TTS_DISK_CACHE_DIR / "manifest.json"
+        if manifest_path.exists():
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            for item in manifest:
+                cache_key = item.get("key")
+                text = item.get("text", "")
+                mp3_file = item.get("mp3_file")
+                pcm_file = item.get("pcm_file")
+                if not cache_key or not mp3_file or not pcm_file:
+                    continue
+                mp3_path = TTS_DISK_CACHE_DIR / mp3_file
+                pcm_path = TTS_DISK_CACHE_DIR / pcm_file
+                if mp3_path.exists() and pcm_path.exists():
+                    with open(mp3_path, "rb") as f_mp3:
+                        mp3_bytes = f_mp3.read()
+                    with open(pcm_path, "rb") as f_pcm:
+                        pcm_bytes = f_pcm.read()
+                    if mp3_bytes and pcm_bytes:
+                        b64_val = base64.b64encode(mp3_bytes).decode("utf-8")
+                        _web_tts_cache[cache_key] = [b64_val]
+                        _web_tts_cache[text.strip()] = [b64_val]
+                        _vonage_pcm_cache[cache_key] = pcm_bytes
+                        _vonage_pcm_cache[text.strip()] = pcm_bytes
+                        count += 1
+            if count > 0:
+                logger.info("Loaded %d persistent TTS entries from disk cache.", count)
+    except Exception as exc:
+        logger.warning("Failed loading TTS disk cache: %s", exc)
+
+
+def save_tts_to_disk_cache(voice: str, text: str, mp3_bytes: bytes, pcm_bytes: bytes) -> None:
+    """Persists a pre-rendered TTS response to disk. Never caches empty/fallback audio."""
+    if not mp3_bytes or not pcm_bytes or not text.strip():
+        return
+    try:
+        TTS_DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_key = _tts_cache_key(voice, text)
+        hash_key = hashlib.sha256(f"{voice}:{text.strip()}".encode("utf-8")).hexdigest()
+        mp3_file = f"{hash_key}.mp3"
+        pcm_file = f"{hash_key}.pcm"
+        with open(TTS_DISK_CACHE_DIR / mp3_file, "wb") as f_mp3:
+            f_mp3.write(mp3_bytes)
+        with open(TTS_DISK_CACHE_DIR / pcm_file, "wb") as f_pcm:
+            f_pcm.write(pcm_bytes)
+
+        manifest_path = TTS_DISK_CACHE_DIR / "manifest.json"
+        manifest = []
+        if manifest_path.exists():
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    manifest = json.load(f)
+            except Exception:
+                manifest = []
+
+        existing_keys = {m.get("key") for m in manifest}
+        if cache_key not in existing_keys:
+            manifest.append({
+                "key": cache_key,
+                "voice": voice,
+                "text": text.strip(),
+                "mp3_file": mp3_file,
+                "pcm_file": pcm_file,
+            })
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+    except Exception as exc:
+        logger.debug("Failed saving TTS disk cache entry for '%s': %s", text[:20], exc)
+
 GREETING_TEXT = "Hello, thank you for calling Logic Pulse. This is Pulse Concierge AI. How can I assist you today?"
 FILLER_CLIPS = ["Ji,", "Ek second,", "Sure,"]
+
+
+SHORT_VALID_REPLIES = {
+    "yes", "no", "ok", "okay", "hi", "hello", "haan", "nahi", "theek", "ji",
+    "jee", "han", "ha", "na",
+    "جی", "ہاں", "نہیں", "ٹھیک", "ہلو", "سلام", "جی ہاں", "جی نہیں",
+}
 
 
 def is_exit_phrase(text: str) -> bool:
     """
     Evaluates whether an utterance is an intentional exit/goodbye command.
-    Uses word boundaries and ensures the call isn't ended on substrings (e.g. 'maybe')
-    or when 'bye' is embedded in a longer conversational query (e.g. 'can you say bye later').
+    Uses fullmatch / exact whole-phrase matching and ensures the call isn't ended on
+    conversational gratitude or queries (e.g. 'thank you', 'shukriya, mujhe pricing batao').
     """
     if not text:
         return False
-    cleaned = re.sub(r"[^\w\s]", " ", text.strip().lower())
+    cleaned = re.sub(r"[^\w\s\u0600-\u06FF]", " ", text.strip().lower())
     words = cleaned.split()
     if not words or len(words) > 5:
         return False
 
     # Conversational or question indicators
-    if any(q in words for q in ("can", "could", "why", "what", "how", "when", "if", "say", "saying", "mean", "world", "tell", "ask")):
+    if any(q in words for q in ("can", "could", "why", "what", "how", "when", "if", "say", "saying", "mean", "world", "tell", "ask", "pricing", "price", "service", "services", "batao", "madad")):
         return False
 
     exact_phrases = {
         "bye", "goodbye", "good bye", "bye bye", "exit", "quit",
         "ok bye", "okay bye", "bye now", "goodbye now", "thanks bye",
         "thank you bye", "allah hafiz", "khuda hafiz", "alvida",
-        "goodbye have a nice day", "goodbye and thank you", "goodbye sir", "bye sir", "bye madam"
+        "goodbye have a nice day", "goodbye and thank you", "goodbye sir", "bye sir", "bye madam",
+        "اللہ حافظ", "خدا حافظ", "الوداع"
     }
     cleaned_phrase = " ".join(words)
-    if cleaned_phrase in exact_phrases:
+    if cleaned_phrase in exact_phrases or text.strip().lower() in exact_phrases:
         return True
 
     # 1 or 2 words with explicit exit token
     if len(words) <= 2:
-        return bool(re.search(r"\b(goodbye|bye|exit|quit|allah\s*hafiz|khuda\s*hafiz|alvida)\b", cleaned_phrase))
+        return bool(re.fullmatch(r"(goodbye|bye|exit|quit|allah\s*hafiz|khuda\s*hafiz|alvida|اللہ\s*حافظ|خدا\s*حافظ|الوداع)", cleaned_phrase))
 
-    # 3 words with conversational polite wrapper
-    if len(words) == 3 and any(w in ("ok", "okay", "thank", "thanks", "sir", "madam", "now", "see") for w in words):
-        return bool(re.search(r"\b(goodbye|bye|exit|quit)\b", cleaned_phrase))
+    # 3 or 4 words with conversational polite wrapper
+    if len(words) <= 4 and any(w in ("ok", "okay", "thank", "thanks", "sir", "madam", "now", "see") for w in words):
+        return bool(re.fullmatch(r"(ok\s+|okay\s+|thank\s+you\s+|thanks\s+)?(goodbye|bye|exit|quit|allah\s*hafiz|khuda\s*hafiz|alvida)", cleaned_phrase))
 
     return False
 
@@ -247,10 +350,33 @@ def get_models_status() -> dict:
     }
 
 
+def log_turn_diagnostic(
+    duration_ms: float,
+    rms: float,
+    vad_speech_ms: float | None,
+    no_speech_prob: float,
+    avg_logprob: float,
+    compression_ratio: float,
+    decision: str,
+) -> None:
+    vad_speech_str = f"{vad_speech_ms:.1f}" if vad_speech_ms is not None else "n/a"
+    logger.info(
+        "Turn Diagnostic: duration_ms=%.1f, rms=%.2f, vad_speech_ms=%s, no_speech_prob=%.2f, avg_logprob=%.2f, compression_ratio=%.2f, decision=%s",
+        duration_ms,
+        rms,
+        vad_speech_str,
+        no_speech_prob,
+        avg_logprob,
+        compression_ratio,
+        decision,
+    )
+
+
 async def transcribe_audio_bytes(
     audio_bytes: bytes,
     telemetry_recorder: VoiceTelemetryRecorder | None = None,
     call_id: str | None = None,
+    vad_speech_ms: float | None = None,
 ) -> str:
     if telemetry_recorder:
         telemetry_recorder.mark_stt_start()
@@ -263,7 +389,59 @@ async def transcribe_audio_bytes(
             telemetry_recorder.mark_stt_end()
         return ""
 
-    cached_lang = _call_language_cache.get(call_id) if call_id else None
+    # 1. Calculate duration and RMS energy metrics
+    min_stt_duration_ms = getattr(settings, "min_stt_duration_ms", 400)
+    audio_dur_ms = (len(audio_bytes) / 32000.0) * 1000.0 if audio_bytes else 0.0
+    min_stt_rms = getattr(settings, "min_stt_rms", 45.0)
+    rms = _calculate_pcm_rms(audio_bytes) if audio_bytes else 0.0
+
+    # Calibration logging per STT turn for min_stt_rms calibration
+    gate_passed = (audio_dur_ms >= min_stt_duration_ms) and (rms >= min_stt_rms)
+    logger.info(
+        "STT Turn Calibration: dur=%.1fms (min=%dms), rms=%.2f (min=%.2f), gate=%s",
+        audio_dur_ms,
+        min_stt_duration_ms,
+        rms,
+        min_stt_rms,
+        "PASSED" if gate_passed else "FAILED",
+    )
+
+    if min_stt_duration_ms > 0 and audio_dur_ms < min_stt_duration_ms:
+        logger.info(
+            "Dropping audio below min duration threshold (dur=%.0fms < min_stt_duration_ms=%dms)",
+            audio_dur_ms,
+            min_stt_duration_ms,
+        )
+        log_turn_diagnostic(
+            duration_ms=audio_dur_ms,
+            rms=rms,
+            vad_speech_ms=vad_speech_ms,
+            no_speech_prob=0.0,
+            avg_logprob=0.0,
+            compression_ratio=1.0,
+            decision=f"dropped (below min duration {min_stt_duration_ms}ms)",
+        )
+        if telemetry_recorder:
+            telemetry_recorder.mark_stt_end()
+        return ""
+
+    if min_stt_rms > 0 and rms < min_stt_rms:
+        logger.info("Dropping audio below RMS energy threshold (rms=%.2f < min_stt_rms=%.2f)", rms, min_stt_rms)
+        log_turn_diagnostic(
+            duration_ms=audio_dur_ms,
+            rms=rms,
+            vad_speech_ms=vad_speech_ms,
+            no_speech_prob=0.0,
+            avg_logprob=0.0,
+            compression_ratio=1.0,
+            decision=f"dropped (below min RMS {min_stt_rms:.2f})",
+        )
+        if telemetry_recorder:
+            telemetry_recorder.mark_stt_end()
+        return ""
+
+    cached_lang = normalize_whisper_language(_call_language_cache.get(call_id)) if call_id else None
+    target_lang = cached_lang or normalize_whisper_language(getattr(settings, "whisper_language", "en"))
 
     # 1. Groq Cloud Whisper path (when enabled & API key configured)
     stt_provider_cfg = getattr(settings, "stt_provider", "groq_whisper")
@@ -272,10 +450,20 @@ async def transcribe_audio_bytes(
             wav_bytes = pcm_to_wav(audio_bytes, sample_rate=16000, channels=1, sampwidth=2)
             groq_svc = GroqService()
             result, detected_lang, dur = await groq_svc.transcribe_audio_with_usage(
-                wav_bytes, language=cached_lang
+                wav_bytes, language=target_lang, prompt=None
             )
-            if call_id and detected_lang and detected_lang != "unknown":
-                _call_language_cache[call_id] = detected_lang
+            norm_lang = normalize_whisper_language(detected_lang)
+            if call_id and norm_lang in ("en", "ur") and len(result.strip()) > 0:
+                current_locked = _call_language_cache.get(call_id)
+                if not current_locked:
+                    _call_language_cache[call_id] = norm_lang
+                elif current_locked != norm_lang:
+                    has_urdu_script = bool(re.search(r"[\u0600-\u06FF]", result))
+                    has_roman_urdu = bool(re.search(r"\b(aap|aapki|hamari|kya|shukriya|kese|hain|hai)\b", result.lower()))
+                    if current_locked == "en" and (has_urdu_script or has_roman_urdu):
+                        _call_language_cache[call_id] = "ur"
+                    elif current_locked == "ur" and not has_urdu_script and not has_roman_urdu and len(result.split()) >= 3:
+                        _call_language_cache[call_id] = "en"
 
             logger.info("Groq transcribed %d bytes | length=%d | lang=%s", len(audio_bytes), len(result), detected_lang)
             if telemetry_recorder:
@@ -287,6 +475,28 @@ async def transcribe_audio_bytes(
                     model=getattr(settings, "groq_whisper_model", "whisper-large-v3-turbo"),
                 )
                 telemetry_recorder.mark_stt_end()
+            result = correct_voice_vocabulary(result)
+
+            metrics = getattr(groq_svc, "last_segment_metrics", {})
+            no_speech = float(metrics.get("no_speech_prob", 0.0))
+            avg_logprob = float(metrics.get("avg_logprob", 0.0))
+            compression = float(metrics.get("compression_ratio", 1.0))
+            drop_reason = getattr(groq_svc, "last_drop_reason", None)
+
+            if not result:
+                decision = f"dropped ({drop_reason or 'empty transcript'})"
+            else:
+                decision = f"sent ('{result}')"
+
+            log_turn_diagnostic(
+                duration_ms=audio_dur_ms,
+                rms=rms,
+                vad_speech_ms=vad_speech_ms,
+                no_speech_prob=no_speech,
+                avg_logprob=avg_logprob,
+                compression_ratio=compression,
+                decision=decision,
+            )
             return result
         except Exception:
             logger.exception("Groq STT failed; falling back to local Faster-Whisper.")
@@ -312,7 +522,6 @@ async def transcribe_audio_bytes(
                     temperature=0.0,
                     vad_filter=False,
                     language=cached_lang,
-                    initial_prompt="Logic Pulse AI Receptionist: Appointments, timings, services in English and Urdu.",
                 )
             else:
                 wav_bytes = pcm_to_wav(audio_bytes, sample_rate=16000, channels=1, sampwidth=2)
@@ -326,7 +535,6 @@ async def transcribe_audio_bytes(
                         temperature=0.0,
                         vad_filter=False,
                         language=cached_lang,
-                        initial_prompt="Logic Pulse AI Receptionist: Appointments, timings, services in English and Urdu.",
                     )
                 finally:
                     if os.path.exists(tmp_name):
@@ -340,6 +548,9 @@ async def transcribe_audio_bytes(
             return text, lang, lang_prob
 
         result, detected_lang, lang_prob = await asyncio.to_thread(_transcribe)
+        if result and is_prompt_echo(result):
+            logger.info("Dropping prompt-echo hallucination transcript from faster-whisper: '%s'", result)
+            result = ""
         if call_id and detected_lang:
             _call_language_cache[call_id] = detected_lang
 
@@ -353,9 +564,33 @@ async def transcribe_audio_bytes(
                 model=getattr(settings, "whisper_model", "base"),
             )
             telemetry_recorder.mark_stt_end()
+        result = correct_voice_vocabulary(result)
+        if not result:
+            decision = "dropped (empty transcript or prompt echo)"
+        else:
+            decision = f"sent ('{result}')"
+
+        log_turn_diagnostic(
+            duration_ms=audio_dur_ms,
+            rms=rms,
+            vad_speech_ms=vad_speech_ms,
+            no_speech_prob=0.0,
+            avg_logprob=0.0,
+            compression_ratio=1.0,
+            decision=decision,
+        )
         return result
     except Exception:
         logger.exception("Audio transcription failed")
+        log_turn_diagnostic(
+            duration_ms=audio_dur_ms,
+            rms=rms,
+            vad_speech_ms=vad_speech_ms,
+            no_speech_prob=0.0,
+            avg_logprob=0.0,
+            compression_ratio=1.0,
+            decision="dropped (transcription exception)",
+        )
         if telemetry_recorder:
             telemetry_recorder.mark_stt_end()
         return ""
@@ -445,19 +680,20 @@ async def generate_tts_chunks(
 
         voice_to_use = voice or _select_tts_voice(text)
         communicate = edge_tts.Communicate(text, voice=voice_to_use)
-        async for chunk in communicate.stream():
-            if chunk.get("type") == "audio":
-                data = chunk.get("data")
-                if isinstance(data, bytes) and data:
-                    if not yielded_any and telemetry_recorder:
-                        telemetry_recorder.mark_tts_first_audio()
-                    yielded_any = True
-                    yield data
-    except Exception:
-        logger.exception("edge-tts failed; falling back to pyttsx3")
+        async with asyncio.timeout(6.0):
+            async for chunk in communicate.stream():
+                if chunk.get("type") == "audio":
+                    data = chunk.get("data")
+                    if isinstance(data, bytes) and data:
+                        if not yielded_any and telemetry_recorder:
+                            telemetry_recorder.mark_tts_first_audio()
+                        yielded_any = True
+                        yield data
+    except (asyncio.TimeoutError, Exception) as exc:
+        logger.warning("edge-tts synthesis failed (%s); falling back to pyttsx3", type(exc).__name__)
         try:
             audio_bytes = await asyncio.to_thread(_pyttsx3_to_wav_bytes, text)
-            if audio_bytes:
+            if audio_bytes and len(audio_bytes) > 0:
                 if not yielded_any and telemetry_recorder:
                     telemetry_recorder.mark_tts_first_audio()
                 yielded_any = True
@@ -485,14 +721,15 @@ async def prewarm_canned_text(text: str, voice: str | None = None) -> None:
         return
     try:
         audio = await synthesize_full_tts(text, voice=voice_to_use)
-        if audio:
+        if audio and len(audio) > 0:
             b64_val = base64.b64encode(audio).decode("utf-8")
             _web_tts_cache[cache_key] = [b64_val]
             _web_tts_cache[text.strip()] = [b64_val]
             pcm = await asyncio.to_thread(mp3_to_pcm, audio, 16000)
-            if pcm:
+            if pcm and len(pcm) > 0:
                 _vonage_pcm_cache[cache_key] = pcm
                 _vonage_pcm_cache[text.strip()] = pcm
+                save_tts_to_disk_cache(voice_to_use, text, audio, pcm)
     except Exception as exc:
         logger.debug("Failed prewarming TTS for %s: %s", text[:20], exc)
 
@@ -517,9 +754,13 @@ async def prewarm_voice_cache() -> None:
     _prewarm_done = True
     logger.info("Prewarming Voice Cache and AI engines...")
 
+    # Load persistent disk cache first so router replies play instantly
+    load_tts_disk_cache()
+
     all_texts = [
         GREETING_TEXT,
         *GREETING_RESPONSES,
+        *HOW_ARE_YOU_RESPONSES,
         *TIMING_RESPONSES,
         *LOCATION_RESPONSES,
         *SERVICES_RESPONSES,
@@ -528,6 +769,7 @@ async def prewarm_voice_cache() -> None:
         *CLARIFICATION_RESPONSES,
         *FALLBACK_RESPONSES,
         *CLOSING_RESPONSES,
+        *ACKNOWLEDGMENT_RESPONSES,
         *FILLER_CLIPS,
         "ہمارے دفتری اوقات پیر سے جمعہ صبح 9 بجے سے شام 5 بجے تک ہیں۔",
         "ہم کسٹم سافٹ ویئر ڈویلپمنٹ، AI اور آٹومیشن سسٹمز، چیٹ بوٹس، بزنس ڈیش بورڈز اور ویب و موبائل ایپلیکیشنز فراہم کرتے ہیں۔",
@@ -566,206 +808,240 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
     current_generation_task: asyncio.Task | None = None
     assistant_is_speaking = False
     assistant_speaking_started_at: float = 0.0
+    barge_in_voiced_ms: float = 0.0
+    barge_in_rms_sum: float = 0.0
+    barge_in_frames_count: int = 0
     active_recorder: VoiceTelemetryRecorder | None = None
     client_listening_sent = False
     loop = asyncio.get_running_loop()
 
-    async def _run_generation_flow(pcm_to_process: bytes, recorder: VoiceTelemetryRecorder):
+    async def _run_generation_flow(
+        pcm_to_process: bytes,
+        recorder: VoiceTelemetryRecorder,
+        vad_speech_ms: float | None = None,
+    ):
         nonlocal assistant_is_speaking, assistant_speaking_started_at
         try:
-            transcript = await transcribe_audio_bytes(pcm_to_process, telemetry_recorder=recorder, call_id=call_id)
-            if not transcript.strip():
-                logger.info("Empty transcript from %d bytes audio.", len(pcm_to_process))
-                await _safe_send_json(websocket, {"type": "no_speech", "data": "No clear speech detected. Please speak again."})
-                recorder.finalize()
-                recorder.log_latency_summary()
-                return
-
-            assistant_is_speaking = True
-            assistant_speaking_started_at = loop.time()
-            await _safe_send_json(websocket, {"type": "transcript", "data": transcript})
-
-            if is_exit_phrase(transcript):
-                await _safe_send_json(websocket, {"type": "goodbye", "data": "Goodbye!"})
-                assistant_is_speaking = False
-                recorder.finalize()
-                recorder.log_latency_summary()
-                raise WebSocketDisconnect()
-
-            system_prompt = voice_receptionist_prompt()
-            await _safe_send_json(websocket, {"type": "response_start", "data": ""})
-
-            # Pipelined LLM and TTS Producer/Consumer
-            task_queue: asyncio.Queue[asyncio.Task[tuple[int, str, bytes] | None] | None] = asyncio.Queue()
-            first_audio_sent = False
-            cancel_filler = asyncio.Event()
-
-            # 700ms filler task: if LLM-bound turn has no audio within 700ms, play one filler
-            async def _filler_timer():
-                try:
-                    await asyncio.sleep(0.700)
-                    if not cancel_filler.is_set() and not first_audio_sent:
-                        voice_pref = settings.tts_voice
-                        filler_clip = (
-                            _web_tts_cache.get(_tts_cache_key(voice_pref, "Ji,"))
-                            or _web_tts_cache.get(_tts_cache_key("ur-PK-UzmaNeural", "Ji,"))
-                            or _web_tts_cache.get("Ji,")
-                            or _web_tts_cache.get("Sure,")
-                            or _web_tts_cache.get(_tts_cache_key(voice_pref, "Sure,"))
-                        )
-                        if filler_clip:
-                            recorder.mark_send_start()
-                            await _safe_send_json(
-                                websocket,
-                                {
-                                    "type": "audio_chunk",
-                                    "data": filler_clip[0],
-                                    "index": -1,
-                                    "is_filler": True,
-                                },
-                            )
-                            recorder.mark_audio_sent()
-                except asyncio.CancelledError:
-                    pass
-
-            filler_task = asyncio.create_task(_filler_timer())
-
-            producer_error: Exception | None = None
-            full_response_parts: list[str] = []
-
-            async def _synthesize_single_sentence(chunk_idx: int, sent_text: str) -> tuple[int, str, bytes] | None:
-                voice = _select_tts_voice(sent_text)
-                cache_key = _tts_cache_key(voice, sent_text)
-                cached = _web_tts_cache.get(cache_key) or _web_tts_cache.get(sent_text.strip())
-                if cached:
-                    full_b64 = "".join(cached)
-                    return (chunk_idx, sent_text, base64.b64decode(full_b64))
-
-                sentence_audio_parts = []
-                async for audio_chunk in generate_tts_chunks(sent_text, voice=voice, telemetry_recorder=recorder):
-                    sentence_audio_parts.append(audio_chunk)
-
-                if sentence_audio_parts:
-                    return (chunk_idx, sent_text, b"".join(sentence_audio_parts))
-                return None
-
-            async def _llm_tts_producer():
-                nonlocal producer_error
-                try:
-                    chunk_index = 0
-                    async for sentence in get_ai_response_stream(
-                        user_name=getattr(user, "name", None) or (phone_number or "guest"),
-                        user_email=getattr(user, "email", None) or f"{getattr(user, 'name', None) or 'guest'}@example.com",
-                        message=transcript,
-                        history=session_history,
-                        system_prompt=system_prompt,
-                        telemetry_recorder=recorder,
-                        user_id=getattr(user, "id", None),
-                    ):
-                        if not sentence.strip():
-                            continue
-                        full_response_parts.append(sentence)
-
-                        t = asyncio.create_task(_synthesize_single_sentence(chunk_index, sentence))
-                        await task_queue.put(t)
-                        chunk_index += 1
-
-                    await task_queue.put(None)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    producer_error = exc
-                    await task_queue.put(None)
-
-            producer_task = asyncio.create_task(_llm_tts_producer())
-            pending_synth_tasks: list[asyncio.Task] = []
-
-            try:
-                while True:
-                    task = await task_queue.get()
-                    if task is None:
-                        break
-                    pending_synth_tasks.append(task)
-                    item = await task
-                    if item is None:
-                        continue
-
-                    chunk_idx, sent_text, audio_bytes = item
-                    encoded = base64.b64encode(audio_bytes).decode("utf-8")
-                    recorder.mark_send_start()
-                    await _safe_send_json(
-                        websocket,
-                        {
-                            "type": "audio_chunk",
-                            "data": encoded,
-                            "index": chunk_idx,
-                        },
-                    )
-                    if not first_audio_sent:
-                        cancel_filler.set()
-                        if not filler_task.done():
-                            filler_task.cancel()
-                        recorder.mark_audio_sent()
-                        first_audio_sent = True
-
-                await producer_task
-                if producer_error:
-                    raise producer_error
-
-            finally:
-                cancel_filler.set()
-                if not filler_task.done():
-                    filler_task.cancel()
-                if not producer_task.done():
-                    producer_task.cancel()
-                for t in pending_synth_tasks:
-                    if not t.done():
-                        t.cancel()
-
-            full_response = " ".join(full_response_parts).strip()
-            cost_obj = getattr(recorder, "cost", None)
-            provider_val = getattr(cost_obj, "provider", "")
-            is_local = (provider_val in ("local_router", "tool_service"))
-            source_type = "tool_service" if provider_val == "tool_service" else ("local_rule" if is_local else "ai_llm")
-            provider_name = "Deterministic Appointment Tool" if provider_val == "tool_service" else ("Local Rule Engine ($0 Cost)" if is_local else f"Groq AI ({getattr(cost_obj, 'model', settings.groq_model)})")
-            await _safe_send_json(
-                websocket,
-                {
-                    "type": "response_end",
-                    "data": full_response,
-                    "source": source_type,
-                    "provider": provider_name,
-                },
-            )
-            assistant_is_speaking = False
-            recorder.finalize()
-            recorder.log_latency_summary()
-
-            if full_response:
-                session_history.append({"role": "user", "content": transcript})
-                session_history.append({"role": "assistant", "content": full_response})
-                max_history = getattr(settings, "short_memory_messages", 12)
-                if len(session_history) > max_history:
-                    del session_history[:-max_history]
-                asyncio.create_task(
-                    save_chat_message(
-                        user_id=user.id,
-                        user_message=transcript,
-                        bot_response=full_response,
-                    )
+            async with asyncio.timeout(20.0):
+                transcript = await transcribe_audio_bytes(
+                    pcm_to_process, telemetry_recorder=recorder, call_id=call_id, vad_speech_ms=vad_speech_ms
                 )
+                transcript = correct_voice_vocabulary(transcript)
+                cleaned_chars = re.sub(r"[^\w\u0600-\u06FF]", "", transcript).strip()
+                cleaned_lower = cleaned_chars.lower()
+                raw_lower = transcript.strip().lower()
+                is_whitelisted = (cleaned_lower in SHORT_VALID_REPLIES) or (raw_lower in SHORT_VALID_REPLIES)
+                is_too_short = len(cleaned_chars) <= 1 and not is_whitelisted
+
+                if not transcript.strip() or not cleaned_chars or is_too_short:
+                    logger.info("Empty or short/punctuation transcript ('%s' -> cleaned='%s') from %d bytes audio.", transcript, cleaned_chars, len(pcm_to_process))
+                    await _safe_send_json(websocket, {"type": "no_speech", "data": "No clear speech detected. Please speak again."})
+                    recorder.finalize()
+                    recorder.log_latency_summary()
+                    return
+
+                assistant_is_speaking = True
+                assistant_speaking_started_at = loop.time()
+                await _safe_send_json(websocket, {"type": "transcript", "data": transcript})
+
+                if is_exit_phrase(transcript):
+                    await _safe_send_json(websocket, {"type": "goodbye", "data": "Goodbye!"})
+                    recorder.finalize()
+                    recorder.log_latency_summary()
+                    return
+
+                system_prompt = voice_receptionist_prompt()
+                await _safe_send_json(websocket, {"type": "response_start", "data": ""})
+
+                # Pipelined LLM and TTS Producer/Consumer
+                task_queue: asyncio.Queue[asyncio.Task[tuple[int, str, bytes] | None] | None] = asyncio.Queue()
+                first_audio_sent = False
+                cancel_filler = asyncio.Event()
+
+                # 700ms filler task: if LLM-bound turn has no audio within 700ms, play one filler
+                async def _filler_timer():
+                    try:
+                        await asyncio.sleep(0.700)
+                        if not cancel_filler.is_set() and not first_audio_sent:
+                            voice_pref = settings.tts_voice
+                            filler_clip = (
+                                _web_tts_cache.get(_tts_cache_key(voice_pref, "Ji,"))
+                                or _web_tts_cache.get(_tts_cache_key("ur-PK-UzmaNeural", "Ji,"))
+                                or _web_tts_cache.get("Ji,")
+                                or _web_tts_cache.get("Sure,")
+                                or _web_tts_cache.get(_tts_cache_key(voice_pref, "Sure,"))
+                            )
+                            if filler_clip:
+                                recorder.mark_send_start()
+                                await _safe_send_json(
+                                    websocket,
+                                    {
+                                        "type": "audio_chunk",
+                                        "data": filler_clip[0],
+                                        "index": -1,
+                                        "is_filler": True,
+                                    },
+                                )
+                                recorder.mark_audio_sent()
+                    except asyncio.CancelledError:
+                        pass
+
+                filler_task = asyncio.create_task(_filler_timer())
+
+                producer_error: Exception | None = None
+                full_response_parts: list[str] = []
+
+                async def _synthesize_single_sentence(chunk_idx: int, sent_text: str) -> tuple[int, str, bytes] | None:
+                    voice = _select_tts_voice(sent_text)
+                    cache_key = _tts_cache_key(voice, sent_text)
+                    cached = _web_tts_cache.get(cache_key) or _web_tts_cache.get(sent_text.strip())
+                    if cached:
+                        full_b64 = "".join(cached)
+                        return (chunk_idx, sent_text, base64.b64decode(full_b64))
+
+                    sentence_audio_parts = []
+                    try:
+                        async with asyncio.timeout(6.0):
+                            async for audio_chunk in generate_tts_chunks(sent_text, voice=voice, telemetry_recorder=recorder):
+                                sentence_audio_parts.append(audio_chunk)
+                    except (asyncio.TimeoutError, Exception) as exc:
+                        logger.warning("Synthesis error for chunk %d (%s): '%s'", chunk_idx, type(exc).__name__, sent_text[:30])
+
+                    if sentence_audio_parts:
+                        return (chunk_idx, sent_text, b"".join(sentence_audio_parts))
+                    return None
+
+                async def _llm_tts_producer():
+                    nonlocal producer_error
+                    try:
+                        chunk_index = 0
+                        async for sentence in get_ai_response_stream(
+                            user_name=getattr(user, "name", None) or (phone_number or "guest"),
+                            user_email=getattr(user, "email", None) or f"{getattr(user, 'name', None) or 'guest'}@example.com",
+                            message=transcript,
+                            history=session_history,
+                            system_prompt=system_prompt,
+                            telemetry_recorder=recorder,
+                            user_id=getattr(user, "id", None),
+                        ):
+                            if not sentence.strip():
+                                continue
+                            full_response_parts.append(sentence)
+
+                            t = asyncio.create_task(_synthesize_single_sentence(chunk_index, sentence))
+                            await task_queue.put(t)
+                            chunk_index += 1
+
+                        await task_queue.put(None)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        producer_error = exc
+                        await task_queue.put(None)
+
+                producer_task = asyncio.create_task(_llm_tts_producer())
+                pending_synth_tasks: list[asyncio.Task] = []
+
+                try:
+                    while True:
+                        task = await task_queue.get()
+                        if task is None:
+                            break
+                        pending_synth_tasks.append(task)
+                        item = await task
+                        if item is None:
+                            continue
+
+                        chunk_idx, sent_text, audio_bytes = item
+                        encoded = base64.b64encode(audio_bytes).decode("utf-8")
+                        recorder.mark_send_start()
+                        await _safe_send_json(
+                            websocket,
+                            {
+                                "type": "audio_chunk",
+                                "data": encoded,
+                                "index": chunk_idx,
+                            },
+                        )
+                        if not first_audio_sent:
+                            cancel_filler.set()
+                            if not filler_task.done():
+                                filler_task.cancel()
+                            recorder.mark_audio_sent()
+                            first_audio_sent = True
+
+                    await producer_task
+                    if producer_error:
+                        raise producer_error
+
+                finally:
+                    cancel_filler.set()
+                    if not filler_task.done():
+                        filler_task.cancel()
+                    if not producer_task.done():
+                        producer_task.cancel()
+                    for t in pending_synth_tasks:
+                        if not t.done():
+                            t.cancel()
+
+                full_response = " ".join(full_response_parts).strip()
+                cost_obj = getattr(recorder, "cost", None)
+                provider_val = getattr(cost_obj, "provider", "")
+                is_local = (provider_val in ("local_router", "tool_service"))
+                source_type = "tool_service" if provider_val == "tool_service" else ("local_rule" if is_local else "ai_llm")
+                provider_name = "Deterministic Appointment Tool" if provider_val == "tool_service" else ("Local Rule Engine ($0 Cost)" if is_local else f"Groq AI ({getattr(cost_obj, 'model', settings.groq_model)})")
+                await _safe_send_json(
+                    websocket,
+                    {
+                        "type": "response_end",
+                        "data": full_response,
+                        "source": source_type,
+                        "provider": provider_name,
+                    },
+                )
+                recorder.finalize()
+                recorder.log_latency_summary()
+
+                if full_response:
+                    session_history.append({"role": "user", "content": transcript})
+                    session_history.append({"role": "assistant", "content": full_response})
+                    max_history = getattr(settings, "short_memory_messages", 12)
+                    if len(session_history) > max_history:
+                        del session_history[:-max_history]
+                    asyncio.create_task(
+                        save_chat_message(
+                            user_id=user.id,
+                            user_message=transcript,
+                            bot_response=full_response,
+                        )
+                    )
+        except asyncio.TimeoutError:
+            logger.warning("Voice turn generation timed out after 20.0s")
+            await _safe_send_json(websocket, {"type": "error", "data": "Response timed out"})
         except asyncio.CancelledError:
             logger.info("Generation flow cancelled due to interruption.")
-            assistant_is_speaking = False
-            recorder.finalize()
         except WebSocketDisconnect:
-            assistant_is_speaking = False
-            raise
+            logger.info("WebSocket disconnected during generation flow.")
         except Exception:
             logger.exception("Error in voice generation flow")
+            await _safe_send_json(websocket, {"type": "error", "data": "Failed to process audio"})
+        finally:
             assistant_is_speaking = False
             recorder.finalize()
-            await _safe_send_json(websocket, {"type": "error", "data": "Failed to process audio"})
+
+    def _create_generation_task(
+        pcm_bytes: bytes,
+        rec: VoiceTelemetryRecorder,
+        vad_speech_ms: float | None = None,
+    ) -> asyncio.Task:
+        task = asyncio.create_task(_run_generation_flow(pcm_bytes, rec, vad_speech_ms=vad_speech_ms))
+        def _on_done(t: asyncio.Task) -> None:
+            if not t.cancelled():
+                exc = t.exception()
+                if exc and not isinstance(exc, (asyncio.CancelledError, WebSocketDisconnect)):
+                    logger.error("Unhandled exception in voice generation task: %s", exc, exc_info=exc)
+        task.add_done_callback(_on_done)
+        return task
 
     try:
         while True:
@@ -797,18 +1073,56 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
 
                 turn_result = turn_detector.process_frame(data)
 
-                if turn_result.turn_started:
-                    # Audio-driven Barge-in: only interrupt if assistant is actively speaking/streaming audio
-                    if assistant_is_speaking and current_generation_task and not current_generation_task.done():
-                        guard_ms = getattr(settings, "barge_in_guard_ms", 300)
-                        time_since_speech_ms = (loop.time() - assistant_speaking_started_at) * 1000.0
-                        # Ignore barge-in for first BARGE_IN_GUARD_MS (speaker echo protection)
-                        if time_since_speech_ms >= guard_ms:
-                            current_generation_task.cancel()
-                            assistant_is_speaking = False
-                            logger.info("Barge-in: Interrupted ongoing voice generation task via audio VAD.")
-                            await _safe_send_json(websocket, {"type": "voice_interrupted"})
+                # Audio-driven Barge-in: only interrupt if assistant is actively speaking/streaming audio
+                if assistant_is_speaking and current_generation_task and not current_generation_task.done():
+                    guard_ms = getattr(settings, "barge_in_guard_ms", 800)
+                    time_since_speech_ms = (loop.time() - assistant_speaking_started_at) * 1000.0
+                    # Ignore barge-in for first barge_in_guard_ms (speaker echo protection)
+                    if time_since_speech_ms >= guard_ms:
+                        chunk_rms = _calculate_pcm_rms(data)
+                        noise_floor = getattr(turn_detector.vad_processor, "noise_floor", 40.0)
+                        min_barge_rms = getattr(settings, "barge_in_min_rms", 120.0)
+                        rms_multiplier = getattr(settings, "barge_in_rms_multiplier", 3.0)
+                        required_rms = max(min_barge_rms, noise_floor * rms_multiplier)
 
+                        if turn_result.is_speech and chunk_rms >= required_rms:
+                            chunk_dur_ms = (len(data) / 32000.0) * 1000.0
+                            barge_in_voiced_ms += chunk_dur_ms
+                            barge_in_rms_sum += chunk_rms
+                            barge_in_frames_count += 1
+
+                            min_speech_ms = getattr(settings, "barge_in_min_speech_ms", 450)
+                            if barge_in_voiced_ms >= min_speech_ms:
+                                avg_barge_rms = barge_in_rms_sum / max(1, barge_in_frames_count)
+                                logger.info(
+                                    "Barge-in triggered: sustained speech detected (duration=%.0fms >= %dms, avg_rms=%.2f >= %.2f, noise_floor=%.2f)",
+                                    barge_in_voiced_ms,
+                                    min_speech_ms,
+                                    avg_barge_rms,
+                                    required_rms,
+                                    noise_floor,
+                                )
+                                current_generation_task.cancel()
+                                assistant_is_speaking = False
+                                barge_in_voiced_ms = 0.0
+                                barge_in_rms_sum = 0.0
+                                barge_in_frames_count = 0
+                                await _safe_send_json(websocket, {"type": "voice_interrupted"})
+                        else:
+                            barge_in_voiced_ms = max(0.0, barge_in_voiced_ms - 100.0)
+                            if barge_in_voiced_ms == 0.0:
+                                barge_in_rms_sum = 0.0
+                                barge_in_frames_count = 0
+                    else:
+                        barge_in_voiced_ms = 0.0
+                        barge_in_rms_sum = 0.0
+                        barge_in_frames_count = 0
+                else:
+                    barge_in_voiced_ms = 0.0
+                    barge_in_rms_sum = 0.0
+                    barge_in_frames_count = 0
+
+                if turn_result.turn_started:
                     if active_recorder is None:
                         active_recorder = VoiceTelemetryRecorder(call_id=call_id, channel="voice_ws")
                         active_recorder.mark_audio_received()
@@ -834,8 +1148,8 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                         current_generation_task.cancel()
                         assistant_is_speaking = False
 
-                    current_generation_task = asyncio.create_task(
-                        _run_generation_flow(pcm_to_process, turn_recorder)
+                    current_generation_task = _create_generation_task(
+                        pcm_to_process, turn_recorder, vad_speech_ms=turn_result.speech_duration_ms
                     )
 
             elif "text" in msg:
@@ -879,10 +1193,13 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                         bytes(turn_detector._active_utterance)
                         or b"".join(turn_detector._pending_speech_frames)
                         or b"".join(turn_detector._pre_buffer)
-                        or (b"\x00\x00" * 320)
                     )
                     turn_detector.reset()
                     client_listening_sent = False
+
+                    if not buffered_audio:
+                        logger.debug("speech_ended received but audio buffer is empty; skipping generation.")
+                        continue
 
                     if active_recorder is None:
                         active_recorder = VoiceTelemetryRecorder(call_id=call_id, channel="voice_ws")
@@ -897,13 +1214,18 @@ async def process_voice_websocket(websocket: WebSocket, phone_number: str | None
                         current_generation_task.cancel()
                         assistant_is_speaking = False
 
-                    current_generation_task = asyncio.create_task(
-                        _run_generation_flow(buffered_audio, turn_recorder)
+                    current_generation_task = _create_generation_task(
+                        buffered_audio, turn_recorder, vad_speech_ms=None
                     )
 
     finally:
+        _call_language_cache.pop(call_id, None)
         if current_generation_task and not current_generation_task.done():
             current_generation_task.cancel()
+            try:
+                await asyncio.shield(current_generation_task)
+            except (asyncio.CancelledError, Exception):
+                pass
             assistant_is_speaking = False
 
 

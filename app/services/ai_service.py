@@ -50,7 +50,7 @@ async def _execute_confirmed_appointment(
 
     is_confirm = bool(
         re.search(
-            r"\b(yes|confirm|i confirm|go ahead|proceed|ok|okay|sure|please submit|submit it|submit|please book|book it|correct|good|sounds good|haan|ji haan|theek hai|kardein|ہاں|جی ہاں|جی|ٹھیک ہے|درست|بک کریں|جمع کرائیں)\b|ہاں|جی ہاں|ٹھیک ہے|درست|بک کریں",
+            r"\b(yes|confirm|i confirm|go ahead|proceed|ok|okay|all right|alright|sure|please submit|submit it|submit|please book|book it|correct|good|sounds good|haan|ji haan|theek hai|kardein|ہاں|جی ہاں|جی|ٹھیک ہے|درست|بک کریں|جمع کرائیں)\b|ہاں|جی ہاں|ٹھیک ہے|درست|بک کریں",
             norm_query,
         )
     )

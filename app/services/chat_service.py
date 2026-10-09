@@ -20,6 +20,7 @@ from app.services.receptionist_router import (
     hour_to_display,
 )
 from app.services.tools_service import AppointmentToolService
+from app.utils.entity_normalizer import correct_voice_vocabulary
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,7 @@ class ChatService:
         return self._groq
 
     async def handle_chat(self, payload: ChatRequest, background_tasks: BackgroundTasks) -> ChatResponse:
+        payload.message = correct_voice_vocabulary(payload.message)
         user = await user_crud.get_or_create(
             self.db,
             user_id=payload.user_id,

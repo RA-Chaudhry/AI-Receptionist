@@ -17,7 +17,7 @@ def test_browser_voice_websocket_speech_turn(client: TestClient, mock_voice_envi
     """
     with client.websocket_connect("/api/v1/voice/stream?phone_number=03001234567") as ws:
         # 1. Send binary audio chunks (listening event)
-        dummy_chunk = b"\x00\x00" * 400
+        dummy_chunk = b"\x10\x10" * 8000  # 500ms audio
         ws.send_bytes(dummy_chunk)
         msg1 = ws.receive_json()
         assert msg1["type"] == "listening"
@@ -63,7 +63,7 @@ def test_browser_voice_websocket_goodbye(client: TestClient, monkeypatch, mock_v
     mock_voice_environment["whisper"].transcript = "goodbye"
 
     with client.websocket_connect("/api/v1/voice/stream") as ws:
-        ws.send_bytes(b"\x00\x00" * 400)
+        ws.send_bytes(b"\x10\x10" * 8000)
         ws.receive_json()  # listening
 
         ws.send_text(json.dumps({"type": "speech_ended"}))
